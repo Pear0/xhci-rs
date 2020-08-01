@@ -14,11 +14,13 @@ use core::time::Duration;
 use volatile::*;
 
 use crate::consts::*;
-use crate::structs::{DeviceContextBaseAddressArray, XHCIRing, EventRingSegmentTable, ScratchPadBufferArray};
+use crate::structs::{DeviceContextBaseAddressArray, XHCIRing, EventRingSegmentTable, ScratchPadBufferArray, XHCIRingSegment};
 use crate::trb::{TRB, CommandTRB, CommandCompletionTRB, TRBType};
 use crate::registers::{InterrupterRegisters, DoorBellRegister};
+use crate::extended_capability::{ExtendedCapabilityTags, ExtendedCapabilityTag};
 
 pub(crate) mod consts;
+pub(crate) mod extended_capability;
 pub(crate) mod registers;
 pub(crate) mod structs;
 pub(crate) mod trb;
@@ -63,6 +65,7 @@ pub trait HAL {
 }
 
 pub struct Xhci<'a> {
+    mmio_virt_base: u64,
     cap: &'static mut XHCICapabilityRegisters,
     op: &'static mut XHCIOperationalRegisters,
     hal: &'a dyn HAL,
@@ -101,6 +104,7 @@ impl<'a> Xhci<'a> {
         info.runtime_offset = cap.rts_offset.read() & CAP_RTSOFFSET_MASK;
 
         Self {
+            mmio_virt_base: base_address,
             cap,
             op: op_regs,
             hal,
@@ -160,6 +164,8 @@ impl<'a> Xhci<'a> {
     }
 
     pub fn do_stuff(&mut self) -> Result<(), &'static str> {
+        self.transfer_ownership()?;
+
         self.reset()?;
         debug!("did reset");
 
@@ -219,7 +225,7 @@ impl<'a> Xhci<'a> {
             self.device_context_baa = Some(Box::new(DeviceContextBaseAddressArray::default()));
         }
 
-        let dcbaa_pa = self.get_ptr(&self.device_context_baa);
+        let dcbaa_pa = self.get_ptr::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap());
         self.op.device_context_base_addr_array_ptr.write(dcbaa_pa);
 
         debug!("[XHCI] DCBAA Setup complete");
@@ -229,7 +235,7 @@ impl<'a> Xhci<'a> {
             self.command_ring = Some(XHCIRing::new_with_capacity(self.hal, 1, true));
         }
 
-        let crcr_pa = self.get_ptr(self.command_ring.as_ref().unwrap().segments[0].as_ref());
+        let crcr_pa = self.get_ptr::<XHCIRingSegment>(self.command_ring.as_ref().unwrap().segments[0].as_ref());
 
         let initial_crcr = self.op.command_ring_control.read();
         debug!("[XHCI] CRCR initial {:x}", initial_crcr);
@@ -254,7 +260,7 @@ impl<'a> Xhci<'a> {
         self.event_ring_table.as_mut().unwrap().segment_count = EVENT_RING_NUM_SEGMENTS;
 
         for idx in 0..EVENT_RING_NUM_SEGMENTS {
-            let pa = self.get_ptr(self.event_ring.as_ref().unwrap().segments[idx].as_ref());
+            let pa = self.get_ptr::<XHCIRingSegment>(self.event_ring.as_ref().unwrap().segments[idx].as_ref());
 
             let ent = self.event_ring_table.as_mut().unwrap();
             ent.segments[idx].segment_size = TRBS_PER_SEGMENT as u32;
@@ -263,7 +269,7 @@ impl<'a> Xhci<'a> {
         }
 
         // Update Interrupter 0 Dequeu Pointer
-        let dequeue_ptr_pa = self.get_ptr(&self.event_ring.as_ref().unwrap().segments[0].trbs[0]);
+        let dequeue_ptr_pa = self.get_ptr::<TRB>(&self.event_ring.as_ref().unwrap().segments[0].trbs[0]);
         self.get_runtime_interrupt_register(0).event_ring_deque_ptr.write(dequeue_ptr_pa & INT_ERDP_DEQUEUE_PTR_MASK);
 
         // set ERST table register with correct count
@@ -273,7 +279,7 @@ impl<'a> Xhci<'a> {
         self.get_runtime_interrupt_register(0).event_ring_table_size.write(tmp);
 
         // Setup Event Ring Segment Table Pointer
-        let erst_pa = self.get_ptr(self.event_ring_table.as_ref().unwrap());
+        let erst_pa = self.get_ptr::<EventRingSegmentTable>(self.event_ring_table.as_ref().unwrap());
         self.get_runtime_interrupt_register(0).event_ring_seg_table_ptr.write(erst_pa);
 
         // Setup Scratchpad Registers
@@ -286,7 +292,7 @@ impl<'a> Xhci<'a> {
             self.scratchpads = Some(Box::new(
                 ScratchPadBufferArray::new_with_capacity(self.hal, num_sp as usize, self.info.page_size as usize)
             ));
-            let scratch_pa = self.get_ptr(self.scratchpads.as_ref().unwrap().as_ref());
+            let scratch_pa = self.get_ptr::<ScratchPadBufferArray>(self.scratchpads.as_ref().unwrap().as_ref());
             self.device_context_baa.as_mut().unwrap().entries[0] = scratch_pa;
         }
 
@@ -363,6 +369,46 @@ impl<'a> Xhci<'a> {
         };
         self.wait_command_complete(ptr).expect("thing");
         debug!("NoOP Complete at {:#x}", ptr);
+    }
+
+    pub fn extended_capability(&self) -> ExtendedCapabilityTags {
+        // The higher 16bits specify the offset from base,
+        // unit is **DWORD**
+        let hcc1val = self.cap.hcc_param1.read();
+        let cap_list_offset = (hcc1val >> 14) & !0b11u32; // LSH 2 so it's in bytes
+        let cap_list_base = self.mmio_virt_base + cap_list_offset as u64;
+        ExtendedCapabilityTags::get(cap_list_base as usize)
+    }
+
+    /// This function transfer the ownership of the controller from BIOS
+    pub fn transfer_ownership(&mut self) -> Result<(), &'static str> {
+        let tags = self.extended_capability().find(|t| {
+            match t {
+                ExtendedCapabilityTag::USBLegacySupport { head: _, bios_own: _, os_own: _ } => true,
+                _ => false
+            }
+        });
+        match tags {
+            Some(t) => {
+                if let ExtendedCapabilityTag::USBLegacySupport { head, bios_own, os_own } = t {
+                    if os_own && bios_own {
+                        return Err("XHCIError::UnexpectedOwnership");
+                    }
+                    if os_own {
+                        return Ok(());
+                    }
+                    let write_ptr = (head as *mut u8).wrapping_offset(3);
+                    let read_ptr = (head as *const u8).wrapping_offset(2);
+                    unsafe { write_ptr.write_volatile(0x1) }; // Claiming Ownership
+                    // Now wait
+                    // TODO implement timeout
+                    while unsafe { read_ptr.read_volatile() } & 0x1 > 1 {}
+                    return Ok(());
+                }
+                panic!("wrong tag type found");
+            }
+            _ => Ok(())
+        }
     }
 
 }
