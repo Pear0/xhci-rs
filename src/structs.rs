@@ -1,11 +1,13 @@
+use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter};
 use core::ops::Deref;
+use core::ptr::NonNull;
 
 use crate::consts::{TRB_LINK_TOGGLE_MASK, TRBS_PER_SEGMENT};
 use crate::HAL;
-use crate::trb::{TRB, LinkTRB};
+use crate::trb::{LinkTRB, TRB};
 
 #[repr(C, align(2048))]
 pub struct DeviceContextBaseAddressArray {
@@ -16,6 +18,41 @@ impl Default for DeviceContextBaseAddressArray {
     fn default() -> Self {
         Self { entries: [0; 256] }
     }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EventRingSegmentEntry {
+    pub addr: u64,
+    pub segment_size: u32,
+    _res1: u32,
+}
+
+impl Default for EventRingSegmentEntry {
+    fn default() -> Self {
+        Self {
+            addr: 0,
+            segment_size: 0,
+            _res1: 0,
+        }
+    }
+}
+
+impl EventRingSegmentEntry {
+    pub fn new(ptr: u64, size: u32) -> EventRingSegmentEntry {
+        EventRingSegmentEntry {
+            addr: ptr,
+            segment_size: size,
+            _res1: 0,
+        }
+    }
+}
+
+#[repr(C, align(64))]
+#[derive(Default)]
+pub struct EventRingSegmentTable {
+    pub segments: [EventRingSegmentEntry; 16],
+    pub segment_count: usize,
 }
 
 /* ----------------------- XHCI Ring ------------------------ */
@@ -136,3 +173,50 @@ impl XHCIRingSegment {
         self.trbs[TRBS_PER_SEGMENT - 1] = TRB { link: link_trb };
     }
 }
+
+
+/* ------------- Scratchpad ----------------- */
+#[repr(C, align(4096))]
+pub struct ScratchPadBufferArray {
+    scratchpads: [u64; 1024],
+    scratchpad_vas: [u64; 1024],
+    page_size: usize,
+}
+
+impl ScratchPadBufferArray {
+    pub fn new_with_capacity<'a>(hal: &'a dyn HAL, num: usize, page_size: usize) -> Self {
+        assert!(num <= 1024, "unsupported count > 1024");
+        let mut thing = Self {
+            scratchpads: [0; 1024],
+            scratchpad_vas: [0; 1024],
+            page_size,
+        };
+        for i in 0..num {
+            let ptr = Global.alloc(Layout::from_size_align(page_size, page_size).expect("alignment"),
+                                   AllocInit::Zeroed).expect("alloc failed").ptr.as_ptr() as u64;
+            thing.scratchpad_vas[i] = ptr;
+            thing.scratchpads[i] = hal.translate_addr(ptr);
+        }
+        thing
+    }
+}
+
+impl Drop for ScratchPadBufferArray {
+    fn drop(&mut self) {
+        debug!("[XHCI] Freeing scratchpad buffers");
+        for pad in self.scratchpad_vas.iter() {
+            if *pad != 0 {
+                unsafe {
+                    Global.dealloc(NonNull::<u8>::new_unchecked((*pad) as *mut u8),
+                                   Layout::from_size_align(self.page_size, self.page_size)
+                                       .expect("align"))
+                };
+            }
+        }
+    }
+}
+
+
+
+
+
