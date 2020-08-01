@@ -2,6 +2,8 @@
 #![feature(global_asm)]
 #![feature(allocator_api)]
 
+#![allow(dead_code)]
+
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
