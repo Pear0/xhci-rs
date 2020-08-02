@@ -4,8 +4,9 @@ use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter};
 use core::ops::Deref;
 use core::ptr::NonNull;
+use modular_bitfield::prelude::*;
 
-use crate::consts::{TRB_LINK_TOGGLE_MASK, TRBS_PER_SEGMENT};
+use crate::consts::*;
 use crate::HAL;
 use crate::trb::{LinkTRB, TRB};
 
@@ -181,6 +182,95 @@ impl XHCIRingSegment {
         let link_trb = LinkTRB::new(other);
         self.trbs[TRBS_PER_SEGMENT - 1] = TRB { link: link_trb };
     }
+}
+
+
+/* ------------- Device Context ------------- */
+
+#[repr(C, align(2048))]
+pub struct InputContext {
+    pub input: [u32; 8],
+    pub slot: SlotContext,
+    pub endpoint: [EndpointContext; 31],
+}
+
+#[repr(C, align(2048))]
+#[derive(Default, Clone)]
+pub struct DeviceContextArray {
+    pub slot: SlotContext,
+    pub endpoint: [EndpointContext; 31],
+}
+
+macro_rules! set_field {
+    ($var: expr, $shift: expr, $mask: expr, $val: expr) => {{
+        let tmp = $var & (!$mask);
+        $var = tmp | (($val << $shift) & $mask);
+    }};
+}
+
+#[repr(C)]
+#[derive(Default, Clone)]
+pub struct EndpointContext {
+    dword1: u32,
+    pub flags1: u8,
+    pub max_burst_size: u8,
+    pub max_packet_size: u16,
+    pub dequeu_pointer: u64,
+    pub average_trb_len: u16,
+    max_esit_payload_lo: u16,
+    _res0: [u32; 3],
+}
+
+impl EndpointContext {
+    pub fn set_lsa_bit(&mut self) {
+        self.dword1 |= EP_CTX_LSA_MASK;
+    }
+
+    pub fn set_cerr(&mut self, val: u8) {
+        set_field!(self.flags1,
+            EP_CTX_CERR_SHIFT, EP_CTX_CERR_MASK,
+            val
+        );
+    }
+
+    pub fn set_ep_type(&mut self, val: u8) {
+        set_field!(self.flags1,
+            EP_CTX_EPTYPE_SHIFT, EP_CTX_EPTYPE_MASK,
+            val
+        );
+    }
+}
+
+#[bitfield]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct SlotContextDW1 {
+    route_string: B20,
+    speed: B4,
+    resz: B1,
+    mtt: bool,
+    hub: bool,
+    context_entries: B5
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Debug)]
+pub struct SlotContext {
+    // DWORD1
+    pub dword1: SlotContextDW1,
+    // DWORD2
+    pub max_exit_latency: u16,
+    pub root_hub_port_number: u8,
+    pub numbr_ports: u8,
+    // DWORD3
+    pub hub_slot_id: u8,
+    pub tt_port_number: u8,
+    pub interrupter_ttt: u16,
+    // DWORD 4
+    pub device_addr: u8,
+    _res0: [u8; 2],
+    pub slot_state: u8,
+    // DWORD 5-8
+    _res1: [u32; 4],
 }
 
 

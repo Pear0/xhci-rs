@@ -197,7 +197,7 @@ impl CommandTRB {
 
     pub fn enable_slot() -> Self {
         let mut trb = Self::default();
-        trb.payload[3] |= (TRB_COMMON_TYPE_SHIFT as u32) << (TRB_TYPE_ENABLE_SLOT_CMD as u32);
+        trb.payload[3] |= (TRB_TYPE_ENABLE_SLOT_CMD as u32) << (TRB_COMMON_TYPE_SHIFT as u32);
         trb
     }
 
