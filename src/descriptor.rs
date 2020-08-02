@@ -1,4 +1,8 @@
 use alloc::vec::Vec;
+use core::fmt;
+
+#[macro_use]
+use crate::macros;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -38,7 +42,7 @@ impl USBInterfaceDescriptorSet {
     pub fn new(ifdesc: USBInterfaceDescriptor) -> Self {
         Self {
             interface: ifdesc,
-            endpoints: Default::default()
+            endpoints: Default::default(),
         }
     }
 }
@@ -92,3 +96,38 @@ impl USBConfigurationDescriptor {
         u16::from_le_bytes(self.total_length)
     }
 }
+
+#[repr(C)]
+struct USBHubDescriptorData([u8; 64]);
+
+impl Default for USBHubDescriptorData {
+    fn default() -> Self {
+        Self([0; 64])
+    }
+}
+
+impl fmt::Debug for USBHubDescriptorData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0.as_ref())
+    }
+}
+
+
+#[derive(Debug, Default)]
+#[repr(C)]
+pub struct USBHubDescriptor {
+    length: u8,
+    pub descriptor_type: u8,
+    pub num_ports: u8,
+    hub_chars: [u8; 2],
+    // Power On to Power Good Time
+    potpgt: u8,
+    max_hub_current: u8,
+
+    // "removable" and "power control mask" bitfields
+    data: USBHubDescriptorData,
+}
+
+const_assert_size!(USBHubDescriptor, 71);
+
+

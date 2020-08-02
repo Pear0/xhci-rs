@@ -25,13 +25,14 @@ use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextBaseAddressArray, EventRingSegmentTable, ScratchPadBufferArray, XHCIRing, XHCIRingSegment, DeviceContextArray, InputContext};
 use crate::trb::{CommandCompletionTRB, CommandTRB, TRB, TRBType, SetupStageTRB, DataStageTRB, EventDataTRB, StatusStageTRB};
-use crate::descriptor::{USBDeviceDescriptor, USBConfigurationDescriptor, USBInterfaceDescriptor, USBEndpointDescriptor, USBConfigurationDescriptorSet, USBInterfaceDescriptorSet};
+use crate::descriptor::{USBDeviceDescriptor, USBConfigurationDescriptor, USBInterfaceDescriptor, USBEndpointDescriptor, USBConfigurationDescriptorSet, USBInterfaceDescriptorSet, USBHubDescriptor};
+
+#[macro_use]
+mod macros;
 
 pub(crate) mod consts;
 pub(crate) mod descriptor;
 pub(crate) mod extended_capability;
-#[macro_use]
-mod macros;
 pub(crate) mod registers;
 pub(crate) mod structs;
 pub(crate) mod trb;
@@ -90,6 +91,10 @@ pub struct XHCIPortOperationalRegisters {
 
 fn get_registers<T>(base: u64) -> &'static mut T {
     unsafe { &mut *(base as *mut T) }
+}
+
+fn as_slice<T>(t: &mut T) -> &mut [u8] {
+    unsafe { core::slice::from_raw_parts_mut(t as *mut T as *mut u8, core::mem::size_of::<T>()) }
 }
 
 pub trait HAL {
@@ -441,6 +446,15 @@ impl<'a> Xhci<'a> {
         )
     }
 
+    fn fetch_class_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
+                        w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
+    {
+        self.send_control_command(slot_id, 0xA0, REQUEST_GET_DESCRIPTOR,
+                                  ((desc_type as u16) << 8) | (desc_index as u16),
+                                  w_index, buf.len() as u16, None, Some(buf),
+        )
+    }
+
     fn fetch_device_descriptor(&mut self, slot_id: u8) -> Result<USBDeviceDescriptor, &'static str> {
         let mut buf2 = [0u8; 18];
         self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_DEVICE, 0, 0, &mut buf2)?;
@@ -448,6 +462,10 @@ impl<'a> Xhci<'a> {
     }
 
     fn fetch_string_descriptor(&mut self, slot: u8, index: u8, lang: u16) -> Result<String, &'static str> {
+        if index == 0 {
+            return Err("invalid descriptor index 0");
+        }
+
         let mut buf = [0u8; 1];
         self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_STRING,
                               index, lang, &mut buf)?;
@@ -546,17 +564,35 @@ impl<'a> Xhci<'a> {
         let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
 
         let configuration = self.fetch_configuration_descriptor(slot as u8)?;
-        debug!("configuration: {:?}", configuration);
+        debug!("configuration: {:#?}", configuration);
 
         // Display things
-        let mfg = self.fetch_string_descriptor(slot as u8, desc.manufacturer_index, lang)?;
-        let prd = self.fetch_string_descriptor(slot as u8, desc.product_index, lang)?;
-        let serial = if desc.serial_index != 0 {
-            self.fetch_string_descriptor(slot as u8, desc.serial_index, lang)?
-        } else {
-            String::from("")
-        };
-        debug!("[XHCI] New device: \nMFG: {}\nPrd:{}\nSerial:{}", mfg, prd, serial);
+        let mfg = self.fetch_string_descriptor(slot as u8, desc.manufacturer_index, lang).unwrap_or(String::from("(no manufacturer name)"));
+        let prd = self.fetch_string_descriptor(slot as u8, desc.product_index, lang).unwrap_or(String::from("(no product name)"));
+        let serial = self.fetch_string_descriptor(slot as u8, desc.serial_index, lang).unwrap_or(String::from("(no serial number)"));
+        debug!("[XHCI] New device:\n  MFG: {}\n  Prd:{}\n  Serial:{}", mfg, prd, serial);
+
+        for interface in configuration.ifsets {
+            if interface.interface.class == CLASS_CODE_HUB {
+                if interface.endpoints.len() == 0 {
+                    warn!("Hub with no endpoints!");
+                    continue;
+                }
+                if interface.endpoints.len() > 1 {
+                    warn!("Hub with more than 1 endpoint!");
+                }
+
+                let endpoint = &interface.endpoints[0];
+
+                let mut hub_descriptor = USBHubDescriptor::default();
+                self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+
+                info!("Hub Descriptor: {:?}", hub_descriptor);
+
+
+
+            }
+        }
 
         // let usb_dev = Arc::new(USBXHCIDevice {
         //     // Device
