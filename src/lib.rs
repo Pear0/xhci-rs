@@ -199,6 +199,14 @@ impl<'a> Xhci<'a> {
         self.hal.flush_cache(ptr, 16);
     }
 
+    fn flush_struct<T>(&self, val: &T) {
+        self.hal.flush_cache(val as *const T as u64, core::mem::size_of_val(val) as u64);
+    }
+
+    fn flush_slice<T>(&self, val: &[T]) {
+        self.hal.flush_cache(val.as_ptr() as u64, core::mem::size_of_val(val) as u64);
+    }
+
     pub fn reset(&mut self) -> Result<(), &'static str> {
         self.op.command.update(|x| *x |= OP_CMD_RESET_MASK);
         self.hal.memory_barrier();
@@ -304,6 +312,8 @@ impl<'a> Xhci<'a> {
         self.device_context_baa.as_mut().expect("").entries[slot] = ctx_ptr;
         self.transfer_rings[slot - 1] = Some(transfer_ring);
 
+        self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref());
+        self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap());
         self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
 
         let ptr = self.command_ring.as_mut().expect("").push(
@@ -318,6 +328,11 @@ impl<'a> Xhci<'a> {
                             write_to_usb: Option<&[u8]>, mut read_from_usb: Option<&mut [u8]>)
                             -> Result<usize, &'static str>
     {
+
+        if let Some(write) = write_to_usb {
+            self.flush_slice(write);
+        }
+
         let setup_trt = if write_to_usb.is_none() && read_from_usb.is_none() {
             0u8
         } else if write_to_usb.is_some() && read_from_usb.is_none() {
@@ -388,10 +403,15 @@ impl<'a> Xhci<'a> {
                         let bytes_requested = if write_to_usb.is_some() {
                             write_to_usb.unwrap().len()
                         } else if read_from_usb.is_some() {
-                            read_from_usb.unwrap().len()
+                            read_from_usb.as_ref().unwrap().len()
                         } else {
                             0
                         };
+
+                        if let Some(read) = read_from_usb {
+                            self.flush_slice(read);
+                        }
+
                         return Ok(bytes_requested - bytes_remain);
                     }
                     _ => {
