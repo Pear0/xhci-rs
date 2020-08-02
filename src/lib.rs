@@ -307,12 +307,13 @@ impl<'a> Xhci<'a> {
         *dev_ctx = DeviceContextArray::default();
         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
+        self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref());
+
         // Activate Entry
         self.device_contexts[slot - 1] = Some(dev_ctx);
         self.device_context_baa.as_mut().expect("").entries[slot] = ctx_ptr;
         self.transfer_rings[slot - 1] = Some(transfer_ring);
 
-        self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref());
         self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap());
         self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
 
