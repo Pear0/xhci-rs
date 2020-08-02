@@ -10,16 +10,18 @@ extern crate alloc;
 #[macro_use]
 extern crate log;
 
+use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
 use alloc::boxed::Box;
+use core::ptr::NonNull;
 use core::time::Duration;
 
 use volatile::*;
 
 use crate::consts::*;
-use crate::structs::{DeviceContextBaseAddressArray, XHCIRing, EventRingSegmentTable, ScratchPadBufferArray, XHCIRingSegment};
-use crate::trb::{TRB, CommandTRB, CommandCompletionTRB, TRBType};
-use crate::registers::{InterrupterRegisters, DoorBellRegister};
-use crate::extended_capability::{ExtendedCapabilityTags, ExtendedCapabilityTag};
+use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
+use crate::registers::{DoorBellRegister, InterrupterRegisters};
+use crate::structs::{DeviceContextBaseAddressArray, EventRingSegmentTable, ScratchPadBufferArray, XHCIRing, XHCIRingSegment};
+use crate::trb::{CommandCompletionTRB, CommandTRB, TRB, TRBType};
 
 pub(crate) mod consts;
 pub(crate) mod extended_capability;
@@ -55,6 +57,30 @@ pub struct XHCIOperationalRegisters {
     config: Volatile<u32>,
 }
 
+
+impl XHCIOperationalRegisters {
+    pub fn as_ptr(&mut self) -> *mut Self {
+        self as *mut Self
+    }
+
+    pub fn get_port_operational_register(&self, port: u8) -> &'static mut XHCIPortOperationalRegisters {
+        assert_ne!(port, 0, "port can't be zero");
+        unsafe { &mut *(((self as *const Self as usize) + 0x400 + 0x10 * (port as usize - 1)) as *mut XHCIPortOperationalRegisters) }
+    }
+}
+
+#[repr(C)]
+pub struct XHCIPortOperationalRegisters {
+    /// Port Status & Ctrl
+    pub portsc: Volatile<u32>,
+    /// Port Power Management Status & Ctrl
+    pub portpmsc: Volatile<u32>,
+    /// Port Link Info
+    pub portli: Volatile<u32>,
+    /// Hardware LMP Control
+    pub porthwlpmc: Volatile<u32>,
+}
+
 fn get_registers<T>(base: u64) -> &'static mut T {
     unsafe { &mut *(base as *mut T) }
 }
@@ -64,6 +90,17 @@ pub trait HAL {
     fn sleep(&self, dur: Duration);
     fn memory_barrier(&self);
     fn translate_addr(&self, addr: u64) -> u64;
+    fn flush_cache(&self, addr: u64, len: u64);
+
+    fn alloc_noncached(&self, layout: Layout) -> Option<u64> {
+        Global.alloc(layout, AllocInit::Zeroed).ok().map(|x| x.ptr.as_ptr() as u64)
+    }
+
+    fn free_noncached(&self, ptr: u64, layout: Layout) {
+        unsafe {
+            Global.dealloc(NonNull::new_unchecked(ptr as *mut u8), layout);
+        }
+    }
 }
 
 pub struct Xhci<'a> {
@@ -148,6 +185,10 @@ impl<'a> Xhci<'a> {
         }
     }
 
+    fn flush_trb(&self, ptr: u64) {
+        self.hal.flush_cache(ptr, 16);
+    }
+
     pub fn reset(&mut self) -> Result<(), &'static str> {
         self.op.command.update(|x| *x |= OP_CMD_RESET_MASK);
         self.hal.memory_barrier();
@@ -165,11 +206,126 @@ impl<'a> Xhci<'a> {
         self.hal.translate_addr(t as *const T as u64)
     }
 
-    pub fn do_stuff(&mut self) -> Result<(), &'static str> {
-        self.transfer_ownership()?;
+    fn reset_port(&mut self, port_id: u8) -> Result<(), &'static str> {
+        self.op.get_port_operational_register(port_id).portsc.update(|tmp| {
+            *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
+            *tmp |= OP_PORT_STATUS_RESET_MASK | OP_PORT_STATUS_PRC_MASK;
+        });
 
-        self.reset()?;
-        debug!("did reset");
+        self.wait_until("failed to reset port", PORT_RESET_TIMEOUT, |this| {
+            let val = this.op.get_port_operational_register(port_id).portsc.read();
+            (val & OP_PORT_STATUS_RESET_MASK == 0) && (OP_PORT_STATUS_PRC_MASK != 0)
+        })?;
+
+        self.op.get_port_operational_register(port_id).portsc.update(|tmp| {
+            *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
+            *tmp |= OP_PORT_STATUS_PRC_MASK;
+        });
+
+        debug!("[XHCI] port {} reset", port_id);
+        Ok(())
+    }
+
+    pub fn send_slot_enable(&mut self) -> Result<u8, &'static str> {
+        let cmd = CommandTRB::enable_slot();
+        let ptr = self.command_ring.as_mut()
+            .expect("no cmd ring found").push(cmd.into());
+        trace!("[XHCI] Sending Slot EN");
+
+        match self.wait_command_complete(ptr) {
+            Some(trb) => Ok(trb.slot),
+            _ => Err("USBError::CommandTimeout")
+        }
+    }
+
+    fn setup_new_device(&mut self, port_id: u8) -> Result<u8, &'static str> {
+        self.reset_port(port_id);
+        let slot = self.send_slot_enable()? as usize;
+        info!("Got slot id: {}", slot);
+
+        Ok(slot as u8)
+
+        // assert_ne!(slot, 0, "invalid slot 0 received");
+        // self.setup_slot(slot as u8, port_id, 0, true);
+        // let mut buf = [0u8; 8];
+        // self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_DEVICE,
+        //                       0, 0, &mut buf)?;
+        // self.reset_port(port_id);
+        // self.setup_slot(slot as u8, port_id, 0, false);
+        // let desc = self.fetch_device_descriptor(slot as u8)?;
+        // // println!("Device Descriptor: {:#?}", desc);
+        // let mut buf = [0u8; 2];
+        // self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_STRING,
+        //                       0, 0, &mut buf)?;
+        // assert_eq!(buf[1], DESCRIPTOR_TYPE_STRING, "Descriptor is not STRING");
+        // assert!(buf[0] >= 4, "has language");
+        // let mut buf2 = vec![0u8; buf[0] as usize];
+        // self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_STRING,
+        //                       0, 0, &mut buf2)?;
+        // let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
+        // // Display things
+        // let mfg = self.fetch_string_descriptor(slot as u8, desc.manufacturer_index, lang)?;
+        // let prd = self.fetch_string_descriptor(slot as u8, desc.product_index, lang)?;
+        // let serial = if desc.serial_index != 0 {
+        //     self.fetch_string_descriptor(slot as u8, desc.serial_index, lang)?
+        // } else {
+        //     String::from("")
+        // };
+        // debug!("[XHCI] New device: \nMFG: {}\nPrd:{}\nSerial:{}", mfg, prd, serial);
+        //
+        // let usb_dev = Arc::new(USBXHCIDevice {
+        //     // Device
+        //     dev_descriptor: desc,
+        //     manufacture: mfg,
+        //     product: prd,
+        //     serial,
+        //     // XHCI
+        //     control_slot: slot as u8,
+        //     xhci_port: port_id,
+        //     controller_id: self.id,
+        //     // USB System
+        //     system_id: G_USB.issue_device_id(),
+        // });
+        //
+        // self.devices.write().push(usb_dev.clone());
+        // G_USB.register_device(usb_dev);
+        //
+        // // let configs = self.fetch_configuration_descriptor(slot as u8)?;
+        // // let config_val = configs.config.config_val;
+        // // debug!("[USB] Applying Config {}", config_val);
+        // // self.send_control_command(slot as u8, 0x0, REQUEST_SET_CONFIGURATION,
+        // //                           config_val as u16, 0, 0, None, None)?;
+        // // // SETUP EPs BEGIN
+        // // for interf in configs.ifsets.iter() {
+        // //     for ep in interf.endpoints.iter() {
+        // //         let epnum = ep.address & 0b1111;
+        // //         let is_in = (ep.address & 0x80) >> 7;
+        // //         let xhci_ep_number = epnum << 1 | is_in;
+        // //         let ring = XHCIRing::new_with_capacity(1, true);
+        // //
+        // //         debug!("[USB] Endpoint #{}, is_out: {}: => ({:#x})", epnum, is_in, xhci_ep_number);
+        // //     }
+        // // }
+        // // // SETUP EPs END
+        // // // GET MAX LUN BEGIN
+        // // use crate::device::usb::consts::*;
+        // // let request_type = USB_REQUEST_TYPE_DIR_DEVICE_TO_HOST | USB_REQUEST_TYPE_TYPE_CLASS | USB_REQUEST_TYPE_RECP_INTERFACE;
+        // // let mut lun = [0u8;1];
+        // // let size = self.send_control_command(slot as u8, request_type, 0xFE, // GET MAX LUN
+        // // 0,0,1, None, Some(&mut lun))?;
+        // // assert_eq!(size, 1, "lun size wrong");
+        // // let lun = if lun[0] == 0xFF { 0x0 } else {lun[0]};
+        // // debug!("MAX LUN: {}", lun);
+        // // GET MAX LUN END
+        // debug!("[XHCI] Completed setup port {} on slot {}", port_id, slot);
+        // return Ok(slot as u8);
+    }
+
+    pub fn do_stuff(&mut self) -> Result<(), &'static str> {
+        // self.transfer_ownership()?;
+
+        //self.reset()?;
+        // debug!("did reset");
 
         {
             let hcsparams1 = self.cap.hcs_params[0].read();
@@ -206,6 +362,8 @@ impl<'a> Xhci<'a> {
         self.initialize_memory_structures()?;
         debug!("[XHCI] Done memory initialization");
 
+        self.hal.flush_cache(self.mmio_virt_base, 0x10000);
+
         // Step 5: Start the Controller !
         self.start()?;
 
@@ -216,7 +374,16 @@ impl<'a> Xhci<'a> {
         let ver = (self.cap.length_and_ver.read() & CAP_HC_VERSION_MASK) >> CAP_HC_VERSION_SHIFT;
         debug!("[XHCI] Controller with version {:04x}", ver);
 
+        self.hal.flush_cache(self.mmio_virt_base, 0x10000);
         self.send_nop();
+
+        for _ in 0..5 {
+            self.hal.flush_cache(self.mmio_virt_base, 0x10000);
+            self.send_nop();
+            self.hal.sleep(Duration::from_secs(1));
+            let crcr = self.op.command_ring_control.read();
+            info!("current crcr: {:#x}", crcr);
+        }
 
         Ok(())
     }
@@ -237,6 +404,10 @@ impl<'a> Xhci<'a> {
             self.command_ring = Some(XHCIRing::new_with_capacity(self.hal, 1, true));
         }
 
+        for i in 0..EVENT_RING_NUM_SEGMENTS {
+            self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64);
+        }
+
         let crcr_pa = self.get_ptr::<XHCIRingSegment>(self.command_ring.as_ref().unwrap().segments[0].as_ref());
 
         let initial_crcr = self.op.command_ring_control.read();
@@ -246,12 +417,23 @@ impl<'a> Xhci<'a> {
                 return Err("CrCr is Running");
             }
 
-            let cyc_state = self.command_ring.as_ref().unwrap().cycle_state as u64;
+            let cyc_state = 0; // self.command_ring.as_ref().unwrap().cycle_state as u64;
             assert_eq!(crcr_pa & 0b111111, 0, "alignment");
             let val64 = (initial_crcr & OP_CRCR_RES_MASK) |
                 (crcr_pa & OP_CRCR_CRPTR_MASK) |
                 (cyc_state & OP_CRCR_CS_MASK);
+
+            self.hal.memory_barrier();
             self.op.command_ring_control.write(val64);
+            self.hal.memory_barrier();
+            self.get_doorbell_regster(0).reg.write(0);
+            self.hal.memory_barrier();
+            for i in 0..EVENT_RING_NUM_SEGMENTS {
+                self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64);
+            }
+
+            let crcr = self.op.command_ring_control.read();
+            info!("current crcr: {:#x}", crcr);
         }
 
         debug!("[XHCI] CRCR Setup complete");
@@ -269,6 +451,8 @@ impl<'a> Xhci<'a> {
             assert_eq!(pa & 0b11_1111, 0, "alignment");
             ent.segments[idx].addr = pa;
         }
+
+        self.hal.flush_cache(self.event_ring_table.as_deref().unwrap() as *const EventRingSegmentTable as u64, core::mem::size_of::<EventRingSegmentTable>() as u64);
 
         // Update Interrupter 0 Dequeu Pointer
         let dequeue_ptr_pa = self.get_ptr::<TRB>(&self.event_ring.as_ref().unwrap().segments[0].trbs[0]);
@@ -344,6 +528,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn wait_command_complete(&mut self, ptr: u64) -> Option<CommandCompletionTRB> {
+        self.hal.memory_barrier();
         // TODO update this code to use interrupt notification system
         self.get_doorbell_regster(0).reg.write(0);
         loop {
@@ -369,8 +554,50 @@ impl<'a> Xhci<'a> {
             debug!("[XHCI] Sending NOOP on index {:?}", cmd_ring.enqueue);
             cmd_ring.push(CommandTRB::noop().into())
         };
-        self.wait_command_complete(ptr).expect("thing");
-        debug!("NoOP Complete at {:#x}", ptr);
+
+        match self.wait_command_complete(ptr) {
+            Some(_) => debug!("NoOP Complete at {:#x}", ptr),
+            None => warn!("NoOP didnt return at {:#x}", ptr),
+        }
+    }
+
+    fn is_port_connected(&self, port_id: u8) -> bool {
+        let port_op = self.op.get_port_operational_register(port_id);
+        let mut port_status = port_op.portsc.read();
+        if port_status & OP_PORT_STATUS_POWER_MASK == 0 {
+            debug!("[XHCI] Port {} not powered. Powering On", port_id);
+            let tmp = (port_status & !OP_PORT_STATUS_PED_MASK) | OP_PORT_STATUS_POWER_MASK;
+            port_op.portsc.write(tmp);
+            while port_op.portsc.read() & OP_PORT_STATUS_POWER_MASK == 0 {}
+            self.hal.sleep(Duration::from_millis(20));
+            port_status = port_op.portsc.read();
+            debug!("[XHCI] port {} powerup complete: status={:#x}", port_id, port_status);
+        }
+        let mut tmp = port_status & !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
+        tmp |= OP_PORT_STATUS_OCC_MASK | OP_PORT_STATUS_CSC_MASK;
+        port_op.portsc.write(tmp);
+
+        // Check if a port is in it's ready state
+        let ready_mask = OP_PORT_STATUS_CCS_MASK;
+        port_op.portsc.read() & ready_mask == ready_mask
+    }
+
+    fn poll_port_status(&mut self, port_id: u8) {
+        let ready = self.is_port_connected(port_id);
+
+        info!("Port {}: connected={}", port_id, ready);
+        if ready {
+            if let Err(e) = self.setup_new_device(port_id) {
+                error!("setup_new_device() err: {}", e);
+            }
+        }
+    }
+
+    pub fn poll_ports(&mut self) {
+        let max_port = self.info.max_port;
+        for port in 1..=max_port {
+            self.poll_port_status(port);
+        }
     }
 
     pub fn extended_capability(&self) -> ExtendedCapabilityTags {
@@ -412,8 +639,102 @@ impl<'a> Xhci<'a> {
             _ => Ok(())
         }
     }
-
 }
+
+#[repr(C, packed)]
+struct Dwc3 {
+    g_sbuscfg0: Volatile<u32>,
+    g_sbuscfg1: Volatile<u32>,
+    g_txthrcfg: Volatile<u32>,
+    g_rxthrcfg: Volatile<u32>,
+    g_ctl: Volatile<u32>,
+
+    reserved1: Volatile<u32>,
+
+    g_sts: Volatile<u32>,
+
+    reserved2: Volatile<u32>,
+
+    g_snpsid: Volatile<u32>,
+    g_gpio: Volatile<u32>,
+    g_uid: Volatile<u32>,
+    g_uctl: Volatile<u32>,
+    g_buserraddr: Volatile<u64>,
+    g_prtbimap: Volatile<u64>,
+
+    g_hwparams0: Volatile<u32>,
+    g_hwparams1: Volatile<u32>,
+    g_hwparams2: Volatile<u32>,
+    g_hwparams3: Volatile<u32>,
+    g_hwparams4: Volatile<u32>,
+    g_hwparams5: Volatile<u32>,
+    g_hwparams6: Volatile<u32>,
+    g_hwparams7: Volatile<u32>,
+
+    g_dbgfifospace: Volatile<u32>,
+    g_dbgltssm: Volatile<u32>,
+    g_dbglnmcc: Volatile<u32>,
+    g_dbgbmu: Volatile<u32>,
+    g_dbglspmux: Volatile<u32>,
+    g_dbglsp: Volatile<u32>,
+    g_dbgepinfo0: Volatile<u32>,
+    g_dbgepinfo1: Volatile<u32>,
+}
+
+const DWC3_GSNPSID_MASK: u32 = 0xffff0000;
+const DWC3_REVISION_MASK: u32 = 0xffff;
+const DWC3_GCTL_SCALEDOWN_MASK: u32 = 3 << 4;
+const DWC3_GCTL_DISSCRAMBLE: u32 = 1 << 3;
+const DWC3_GCTL_U2RSTECN: u32 = 1 << 16;
+
+const DWC3_GCTL_PRTCAP_HOST: u32 = 1;
+const DWC3_GCTL_PRTCAP_DEVICE: u32 = 2;
+const DWC3_GCTL_PRTCAP_OTG: u32 = 3;
+
+pub fn init_dwc3(base_address: u64) {
+    let dwc3 = unsafe { &mut *((base_address + 0xC100) as *mut Dwc3) };
+
+    // ====== Core Init =====
+
+    let revision = dwc3.g_snpsid.read();
+    /* This should read as U3 followed by revision number */
+    if (revision & DWC3_GSNPSID_MASK) != 0x55330000 {
+        warn!("This is not a DesignWare USB3 DRD Core, id mask: {:#x}", revision);
+    } else {
+        debug!("init DesignWare USB3 DRD Core, id mask: {:#x}", revision);
+    }
+
+    // TODO issue a soft reset
+
+    let mut reg = dwc3.g_ctl.read();
+    reg &= !DWC3_GCTL_SCALEDOWN_MASK;
+    reg |= DWC3_GCTL_DISSCRAMBLE;
+    // TODO enable any power opt
+
+    /*
+   * WORKAROUND: DWC3 revisions <1.90a have a bug
+   * where the device can fail to connect at SuperSpeed
+   * and falls back to high-speed mode which causes
+   * the device to enter a Connect/Disconnect loop
+   */
+    if (revision & DWC3_REVISION_MASK) < 0x190a {
+        reg |= DWC3_GCTL_U2RSTECN;
+    }
+
+    dwc3.g_ctl.write(reg);
+
+    // ===== Set Mode =====
+
+    /* We are hard-coding DWC3 core to Host Mode */
+    let mut reg = dwc3.g_ctl.read();
+    // clear mask
+    reg &= !((DWC3_GCTL_PRTCAP_OTG) << 12);
+    reg |= ((DWC3_GCTL_PRTCAP_HOST) << 12);
+    dwc3.g_ctl.write(reg);
+
+    debug!("did dwc3_init()");
+}
+
 
 pub fn do_stuff(base_address: u64, hal: &dyn HAL) {
     match Xhci::new(base_address, hal).do_stuff() {
