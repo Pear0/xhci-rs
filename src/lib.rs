@@ -380,6 +380,8 @@ impl<'a> Xhci<'a> {
         for _ in 0..5 {
             self.hal.flush_cache(self.mmio_virt_base, 0x10000);
             self.send_nop();
+            self.hal.flush_cache(self.mmio_virt_base, 0x10000);
+            self.poll_ports();
             self.hal.sleep(Duration::from_secs(1));
             let crcr = self.op.command_ring_control.read();
             info!("current crcr: {:#x}", crcr);
@@ -417,7 +419,7 @@ impl<'a> Xhci<'a> {
                 return Err("CrCr is Running");
             }
 
-            let cyc_state = 0; // self.command_ring.as_ref().unwrap().cycle_state as u64;
+            let cyc_state = self.command_ring.as_ref().unwrap().cycle_state as u64;
             assert_eq!(crcr_pa & 0b111111, 0, "alignment");
             let val64 = (initial_crcr & OP_CRCR_RES_MASK) |
                 (crcr_pa & OP_CRCR_CRPTR_MASK) |
