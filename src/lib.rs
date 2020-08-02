@@ -29,6 +29,8 @@ use crate::descriptor::USBDeviceDescriptor;
 pub(crate) mod consts;
 pub(crate) mod descriptor;
 pub(crate) mod extended_capability;
+#[macro_use]
+mod macros;
 pub(crate) mod registers;
 pub(crate) mod structs;
 pub(crate) mod trb;
@@ -287,21 +289,22 @@ impl<'a> Xhci<'a> {
         epctx.dequeu_pointer = transfer_ring_ptr | 0x1; // Cycle Bit
         trace!("[XHCI] speed after reset, {}, {:x}", speed, portsc);
 
-        let mut input_ctx = Box::new(InputContext {
-            input: Default::default(),
-            slot: dev_ctx.slot.clone(),
-            endpoint: dev_ctx.endpoint.clone(),
-        });
-        input_ctx.input[1] = 0b11;
+        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+        *input_ctx.get_slot_mut() = dev_ctx.slot.clone();
+        for i in 0..31 {
+            *input_ctx.get_endpoint_mut(i) = dev_ctx.endpoint[i].clone();
+        }
+        input_ctx.get_input_mut()[1] = 0b11;
+
         *dev_ctx = DeviceContextArray::default();
-        let input_ctx_ptr = self.get_ptr::<InputContext>(input_ctx.as_ref());
+        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
         // Activate Entry
         self.device_contexts[slot - 1] = Some(dev_ctx);
         self.device_context_baa.as_mut().expect("").entries[slot] = ctx_ptr;
         self.transfer_rings[slot - 1] = Some(transfer_ring);
 
-        self.hal.flush_cache(input_ctx.as_ref() as *const InputContext as u64, core::mem::size_of::<InputContext>() as u64);
+        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
 
         let ptr = self.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::address_device(slot as u8, input_ctx_ptr, block_cmd) }
@@ -506,10 +509,10 @@ impl<'a> Xhci<'a> {
     }
 
     pub fn do_stuff(&mut self) -> Result<(), &'static str> {
-        // self.transfer_ownership()?;
+        self.transfer_ownership()?;
 
-        //self.reset()?;
-        // debug!("did reset");
+        self.reset()?;
+        debug!("did reset");
 
         {
             let hcsparams1 = self.cap.hcs_params[0].read();
@@ -557,14 +560,9 @@ impl<'a> Xhci<'a> {
         debug!("[XHCI] Controller with version {:04x}", ver);
 
         self.send_nop();
-
-        for _ in 0..5 {
-            self.send_nop();
-            self.poll_ports();
-            self.hal.sleep(Duration::from_secs(1));
-            let crcr = self.op.command_ring_control.read();
-            info!("current crcr: {:#x}", crcr);
-        }
+        self.poll_ports();
+        let crcr = self.op.command_ring_control.read();
+        info!("current crcr: {:#x}", crcr);
 
         Ok(())
     }

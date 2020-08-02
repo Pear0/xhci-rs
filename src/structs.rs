@@ -187,11 +187,65 @@ impl XHCIRingSegment {
 
 /* ------------- Device Context ------------- */
 
+
+#[derive(Default)]
 #[repr(C, align(2048))]
-pub struct InputContext {
-    pub input: [u32; 8],
-    pub slot: SlotContext,
-    pub endpoint: [EndpointContext; 31],
+pub struct InputContextTempl<S: Sized + Copy> {
+    input: [u32; 8],
+    __res0: S,
+    slot: SlotContext,
+    __res1: S,
+    endpoint: [(EndpointContext, S); 31],
+}
+
+pub enum InputContext {
+    Normal(InputContextTempl<[u8; 0]>),
+    Big(InputContextTempl<[u8; 32]>),
+}
+
+impl InputContext {
+    pub fn new_normal() -> Self {
+        Self::Normal(InputContextTempl::default())
+    }
+
+    pub fn new_big() -> Self {
+        Self::Big(InputContextTempl::default())
+    }
+
+    pub fn get_input_mut(&mut self) -> &mut [u32; 8] {
+        match self {
+            InputContext::Normal(c) => &mut c.input,
+            InputContext::Big(c) => &mut c.input,
+        }
+    }
+
+    pub fn get_slot_mut(&mut self) -> &mut SlotContext {
+        match self {
+            InputContext::Normal(c) => &mut c.slot,
+            InputContext::Big(c) => &mut c.slot,
+        }
+    }
+
+    pub fn get_endpoint_mut(&mut self, index: usize) -> &mut EndpointContext {
+        match self {
+            InputContext::Normal(c) => &mut c.endpoint[index].0,
+            InputContext::Big(c) => &mut c.endpoint[index].0,
+        }
+    }
+
+    pub fn get_ptr_va(&mut self) -> u64 {
+        match self {
+            InputContext::Normal(c) => c as *const InputContextTempl<[u8; 0]> as u64,
+            InputContext::Big(c) => c as *const InputContextTempl<[u8; 32]> as u64,
+        }
+    }
+
+    pub fn get_size(&mut self) -> usize {
+        match self {
+            InputContext::Normal(c) => core::mem::size_of_val(c),
+            InputContext::Big(c) => core::mem::size_of_val(c),
+        }
+    }
 }
 
 #[repr(C, align(2048))]

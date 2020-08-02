@@ -48,6 +48,8 @@ pub union TRB {
     pseudo: PseudoTRB,
 }
 
+const_assert_size!(TRB, 16);
+
 impl Debug for TRB {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(f, "Generic TRB with type={}", self.type_id())
