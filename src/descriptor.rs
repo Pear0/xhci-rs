@@ -21,26 +21,27 @@ pub struct USBDeviceDescriptor {
     pub config_count: u8,
 }
 
+#[derive(Debug)]
+pub struct USBConfigurationDescriptorSet {
+    pub config: USBConfigurationDescriptor,
+    pub ifsets: Vec<USBInterfaceDescriptorSet>,
+}
 
-// pub struct USBConfigurationDescriptorSet {
-//     pub config: USBConfigurationDescriptor,
-//     pub ifsets: Vec<USBInterfaceDescriptorSet>,
-// }
-//
-// // NOT A Descriptor
-// pub struct USBInterfaceDescriptorSet {
-//     pub interface: USBInterfaceDescriptor,
-//     pub endpoints: Vec<USBEndpointDescriptor>,
-// }
-//
-// impl USBInterfaceDescriptorSet {
-//     pub fn new(ifdesc: USBInterfaceDescriptor) -> Self {
-//         Self {
-//             interface: ifdesc,
-//             endpoints: Default::default()
-//         }
-//     }
-// }
+// NOT A Descriptor
+#[derive(Debug)]
+pub struct USBInterfaceDescriptorSet {
+    pub interface: USBInterfaceDescriptor,
+    pub endpoints: Vec<USBEndpointDescriptor>,
+}
+
+impl USBInterfaceDescriptorSet {
+    pub fn new(ifdesc: USBInterfaceDescriptor) -> Self {
+        Self {
+            interface: ifdesc,
+            endpoints: Default::default()
+        }
+    }
+}
 
 #[derive(Debug)]
 #[repr(C)]

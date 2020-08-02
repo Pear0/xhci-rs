@@ -13,6 +13,7 @@ extern crate log;
 
 use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::time::Duration;
@@ -24,7 +25,7 @@ use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextBaseAddressArray, EventRingSegmentTable, ScratchPadBufferArray, XHCIRing, XHCIRingSegment, DeviceContextArray, InputContext};
 use crate::trb::{CommandCompletionTRB, CommandTRB, TRB, TRBType, SetupStageTRB, DataStageTRB, EventDataTRB, StatusStageTRB};
-use crate::descriptor::USBDeviceDescriptor;
+use crate::descriptor::{USBDeviceDescriptor, USBConfigurationDescriptor, USBInterfaceDescriptor, USBEndpointDescriptor, USBConfigurationDescriptorSet, USBInterfaceDescriptorSet};
 
 pub(crate) mod consts;
 pub(crate) mod descriptor;
@@ -334,6 +335,11 @@ impl<'a> Xhci<'a> {
             self.flush_slice(write);
         }
 
+        // TODO maybe don't always use DC CIVAC...
+        if let Some(read) = &read_from_usb {
+            self.flush_slice(read);
+        }
+
         let setup_trt = if write_to_usb.is_none() && read_from_usb.is_none() {
             0u8
         } else if write_to_usb.is_some() && read_from_usb.is_none() {
@@ -441,6 +447,77 @@ impl<'a> Xhci<'a> {
         Ok(unsafe { core::mem::transmute(buf2) })
     }
 
+    fn fetch_string_descriptor(&mut self, slot: u8, index: u8, lang: u16) -> Result<String, &'static str> {
+        let mut buf = [0u8; 1];
+        self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_STRING,
+                              index, lang, &mut buf)?;
+        if buf[0] == 0 {
+            return Err("USBError::DescriptorNotAvailable");
+        }
+        let mut buf2: Vec<u8> = Vec::new();
+        buf2.resize(buf[0] as usize, 0);
+        self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_STRING,
+                              index, lang, &mut buf2)?;
+        assert_eq!(buf2[1], DESCRIPTOR_TYPE_STRING);
+        let buf2: Vec<u16> = buf2.chunks_exact(2)
+            .map(|l| { u16::from_ne_bytes([l[0], l[1]]) }).collect();
+        Ok(String::from_utf16_lossy(&buf2[1..]))
+    }
+
+    fn fetch_configuration_descriptor(&mut self, slot_id: u8) -> Result<USBConfigurationDescriptorSet, &'static str> {
+        // use pretty_hex::*;
+        let mut config_descriptor = [0u8; 9];
+        self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_CONFIGURATION, 0, 0, &mut config_descriptor)?;
+        let config: USBConfigurationDescriptor = unsafe { core::mem::transmute(config_descriptor) };
+        let mut buf2: Vec<u8> = Vec::new();
+        buf2.resize(config.get_total_length() as usize, 0);
+        self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_CONFIGURATION, 0, 0, &mut buf2)?;
+        let mut current_index = core::mem::size_of::<USBConfigurationDescriptor>();
+        let mut interfaces: Vec<USBInterfaceDescriptorSet> = Default::default();
+        let mut interface_set: Option<USBInterfaceDescriptorSet> = None;
+        loop {
+            if current_index + 2 > buf2.len() {
+                if current_index != buf2.len() {
+                    warn!("[USB] Descriptor not fully fetched");
+                }
+                break;
+            }
+            let desc_size = buf2[current_index] as usize;
+            if desc_size == 0 {
+                break;
+            }
+            let desc_type = buf2[current_index + 1];
+            match desc_type {
+                DESCRIPTOR_TYPE_INTERFACE => {
+                    if interface_set.is_some() {
+                        interfaces.push(interface_set.unwrap());
+                    }
+                    let desc: USBInterfaceDescriptor = Self::into_type(&buf2[current_index..current_index + desc_size]);
+                    interface_set = Some(USBInterfaceDescriptorSet::new(desc));
+                }
+                DESCRIPTOR_TYPE_ENDPOINT => {
+                    let desc: USBEndpointDescriptor = Self::into_type(&buf2[current_index..current_index + desc_size]);
+                    match &mut interface_set {
+                        Some(ifset) => {
+                            ifset.endpoints.push(desc);
+                        }
+                        _ => {
+                            error!("[USB] EP Descriptor without IF");
+                        }
+                    }
+                }
+                _ => {
+                    debug!("[USB] Unexpected descriptor type: {}", desc_type);
+                }
+            }
+            current_index += desc_size;
+        }
+        if let Some(ifset) = interface_set {
+            interfaces.push(ifset);
+        }
+        Ok(USBConfigurationDescriptorSet { config, ifsets: interfaces })
+    }
+
     fn setup_new_device(&mut self, port_id: u8) -> Result<u8, &'static str> {
         self.reset_port(port_id);
         let slot = self.send_slot_enable()? as usize;
@@ -468,19 +545,19 @@ impl<'a> Xhci<'a> {
                               0, 0, &mut buf2)?;
         let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
 
+        let configuration = self.fetch_configuration_descriptor(slot as u8)?;
+        debug!("configuration: {:?}", configuration);
 
+        // Display things
+        let mfg = self.fetch_string_descriptor(slot as u8, desc.manufacturer_index, lang)?;
+        let prd = self.fetch_string_descriptor(slot as u8, desc.product_index, lang)?;
+        let serial = if desc.serial_index != 0 {
+            self.fetch_string_descriptor(slot as u8, desc.serial_index, lang)?
+        } else {
+            String::from("")
+        };
+        debug!("[XHCI] New device: \nMFG: {}\nPrd:{}\nSerial:{}", mfg, prd, serial);
 
-
-        // // Display things
-        // let mfg = self.fetch_string_descriptor(slot as u8, desc.manufacturer_index, lang)?;
-        // let prd = self.fetch_string_descriptor(slot as u8, desc.product_index, lang)?;
-        // let serial = if desc.serial_index != 0 {
-        //     self.fetch_string_descriptor(slot as u8, desc.serial_index, lang)?
-        // } else {
-        //     String::from("")
-        // };
-        // debug!("[XHCI] New device: \nMFG: {}\nPrd:{}\nSerial:{}", mfg, prd, serial);
-        //
         // let usb_dev = Arc::new(USBXHCIDevice {
         //     // Device
         //     dev_descriptor: desc,
@@ -839,6 +916,21 @@ impl<'a> Xhci<'a> {
             }
             _ => Ok(())
         }
+    }
+
+    fn into_type<T: Sized>(buf: &[u8]) -> T {
+        let mut thing: T = unsafe { core::mem::zeroed() };
+        {
+            let tmp_slice = unsafe {
+                core::slice::from_raw_parts_mut(
+                    &mut thing as *mut T as *mut u8,
+                    core::mem::size_of::<T>(),
+                )
+            };
+            assert_eq!(tmp_slice.len(), buf.len(), "Unexpected size");
+            tmp_slice.copy_from_slice(&buf);
+        }
+        thing
     }
 }
 
