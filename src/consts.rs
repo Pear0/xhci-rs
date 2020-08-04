@@ -172,7 +172,8 @@ pub const DESCRIPTOR_TYPE_ENDPOINT: u8 = 5;
 pub const DESCRIPTOR_TYPE_DEVICE_QUALIFIER: u8 = 6;
 pub const DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION: u8 = 7;
 pub const DESCRIPTOR_TYPE_INTERFACE_POWER: u8 = 8;
-pub const DESCRIPTOR_TYPE_HUB: u8 = 29;
+pub const DESCRIPTOR_TYPE_HUB: u8 = 0x29;
+pub const DESCRIPTOR_TYPE_SS_HUB: u8 = 0x2A;
 
 /* ---------- Class Codes ----------- */
 pub const CLASS_CODE_HUB: u8 = 9;

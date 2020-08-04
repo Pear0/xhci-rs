@@ -1,7 +1,5 @@
 use alloc::vec::Vec;
 use core::fmt;
-
-#[macro_use]
 use crate::macros;
 
 #[derive(Debug)]
@@ -23,6 +21,17 @@ pub struct USBDeviceDescriptor {
     pub product_index: u8,
     pub serial_index: u8,
     pub config_count: u8,
+}
+
+impl USBDeviceDescriptor {
+    pub fn get_max_packet_size(&self) -> u32 {
+        match self.max_packet_size {
+            8 => 8,
+            32 => 32,
+            64 => 64,
+            _ => 1u32 << self.max_packet_size,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -61,22 +70,17 @@ pub struct USBInterfaceDescriptor {
     pub ifstr_index: u8,
 }
 
-#[repr(C)]
-#[derive(Debug)]
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
 pub struct USBEndpointDescriptor {
     length: u8,
     pub descriptor_type: u8,
     pub address: u8,
     pub attr: u8,
-    max_packet_size: [u8; 2],
+    pub max_packet_size: u16,
     pub interval: u8,
 }
-
-impl USBEndpointDescriptor {
-    pub fn get_max_packet_size(&self) -> u16 {
-        u16::from_le_bytes(self.max_packet_size)
-    }
-}
+const_assert_size!(USBEndpointDescriptor, 7);
 
 #[derive(Debug)]
 #[repr(C)]

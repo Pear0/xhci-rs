@@ -3,7 +3,7 @@
 #![feature(global_asm)]
 #![feature(llvm_asm)]
 
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports, unused_parens)]
 
 #![cfg_attr(not(test), no_std)]
 
@@ -250,7 +250,7 @@ impl<'a> Xhci<'a> {
         Ok(())
     }
 
-    pub fn send_slot_enable(&mut self) -> Result<u8, &'static str> {
+    fn send_slot_enable(&mut self) -> Result<u8, &'static str> {
         let cmd = CommandTRB::enable_slot();
         let ptr = self.command_ring.as_mut()
             .expect("no cmd ring found").push(cmd.into());
@@ -332,10 +332,9 @@ impl<'a> Xhci<'a> {
 
     fn send_control_command(&mut self, slot_id: u8, request_type: u8, request: u8,
                             value: u16, index: u16, length: u16,
-                            write_to_usb: Option<&[u8]>, mut read_from_usb: Option<&mut [u8]>)
+                            write_to_usb: Option<&[u8]>, read_from_usb: Option<&mut [u8]>)
                             -> Result<usize, &'static str>
     {
-
         if let Some(write) = write_to_usb {
             self.flush_slice(write);
         }
@@ -427,7 +426,7 @@ impl<'a> Xhci<'a> {
                         return Ok(bytes_requested - bytes_remain);
                     }
                     _ => {
-                        trace!("[XHCI] Unexp TRB: {:?}", &trb);
+                        debug!("[XHCI] Unexpected TRB: {:?}", &trb);
                     }
                 }
             } else {
@@ -447,7 +446,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn fetch_class_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
-                        w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
+                              w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
     {
         self.send_control_command(slot_id, 0xA0, REQUEST_GET_DESCRIPTOR,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
@@ -508,7 +507,7 @@ impl<'a> Xhci<'a> {
             match desc_type {
                 DESCRIPTOR_TYPE_INTERFACE => {
                     if interface_set.is_some() {
-                        interfaces.push(interface_set.unwrap());
+                        interfaces.push(interface_set.take().unwrap());
                     }
                     let desc: USBInterfaceDescriptor = Self::into_type(&buf2[current_index..current_index + desc_size]);
                     interface_set = Some(USBInterfaceDescriptorSet::new(desc));
@@ -547,7 +546,7 @@ impl<'a> Xhci<'a> {
         self.setup_slot(slot as u8, port_id, 0, true);
         let mut buf = [0u8; 8];
         self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_DEVICE,
-                               0, 0, &mut buf)?;
+                              0, 0, &mut buf)?;
         self.reset_port(port_id);
         self.setup_slot(slot as u8, port_id, 0, false);
         let desc = self.fetch_device_descriptor(slot as u8)?;
@@ -573,6 +572,10 @@ impl<'a> Xhci<'a> {
         debug!("[XHCI] New device:\n  MFG: {}\n  Prd:{}\n  Serial:{}", mfg, prd, serial);
 
         for interface in configuration.ifsets {
+            if interface.interface.alt_set != 0 {
+                debug!("Skipping non-default altSetting Interface");
+                continue;
+            }
             if interface.interface.class == CLASS_CODE_HUB {
                 if interface.endpoints.len() == 0 {
                     warn!("Hub with no endpoints!");
@@ -585,12 +588,12 @@ impl<'a> Xhci<'a> {
                 let endpoint = &interface.endpoints[0];
 
                 let mut hub_descriptor = USBHubDescriptor::default();
-                self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-
+                if desc.get_max_packet_size() >= 512 {
+                    self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                } else {
+                    self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                }
                 info!("Hub Descriptor: {:?}", hub_descriptor);
-
-
-
             }
         }
 
@@ -836,7 +839,7 @@ impl<'a> Xhci<'a> {
             if self.hal.current_time() > timeout {
                 return None;
             }
-            self.hal.sleep(Duration::from_millis(10));
+            self.hal.sleep(Duration::from_millis(1));
         }
     }
 
@@ -970,7 +973,7 @@ impl<'a> Xhci<'a> {
     }
 }
 
-#[repr(C, packed)]
+#[repr(C)]
 struct Dwc3 {
     g_sbuscfg0: Volatile<u32>,
     g_sbuscfg1: Volatile<u32>,
