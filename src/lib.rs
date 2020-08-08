@@ -428,8 +428,6 @@ impl<'a> Xhci<'a> {
         setup.metadata.set_trb_type(TRB_TYPE_SETUP as u8);
         setup.metadata.set_trt(setup_trt);
         setup.int_target_trb_length.set_trb_length(8); // Always 8: Section 6.4.1.2.1, Table 6-25
-        // self.transfer_rings[slot_id as usize - 1].as_mut()
-        //     .expect("").push(TRB { setup });
         {
             let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
             lock.push(TRB { setup });
@@ -458,24 +456,23 @@ impl<'a> Xhci<'a> {
                 let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
                 lock.push(TRB { data });
             }
+
         }
+        // Event Data TRB
+        let mut event_data = EventDataTRB::default();
+        event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
+        {
+            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+            lock.push(TRB { event_data });
+        }
+
         // Status TRB
         let mut status_stage = StatusStageTRB::default();
         status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
         status_stage.meta.set_ioc(true);
-
         {
             let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
             lock.push(TRB { status_stage });
-        }
-
-        // Event Data TRB
-        let mut event_data = EventDataTRB::default();
-        event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
-
-        {
-            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-            lock.push(TRB { event_data });
         }
 
         // Section 5.6: Table 5-43: Doorbell values
@@ -486,6 +483,7 @@ impl<'a> Xhci<'a> {
             if let Some(trb) = result {
                 match trb {
                     TRBType::TransferEvent(t) => {
+                        debug!("Transfer Complete: status = {}", t.status.get_code());
                         let bytes_remain = t.status.get_bytes_remain() as usize;
                         let bytes_requested = if write_to_usb.is_some() {
                             write_to_usb.unwrap().len()
@@ -669,6 +667,7 @@ impl<'a> Xhci<'a> {
 
         assert_ne!(slot, 0, "invalid slot 0 received");
         self.setup_slot(&port, speed, max_packet_size, true);
+        debug!("Slot Setup");
         let mut buf = [0u8; 8];
         self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_DEVICE,
                               0, 0, &mut buf)?;
@@ -772,6 +771,7 @@ impl<'a> Xhci<'a> {
                     self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                 }
                 info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
+                self.hal.sleep(Duration::from_secs(1));
 
 
                 for num in 1..=hub_descriptor.num_ports {
