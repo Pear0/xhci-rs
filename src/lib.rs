@@ -338,9 +338,18 @@ impl<'a> Xhci<'a> {
 
         let index = self.get_epctx_index(endpoint_address);
 
-        debug!("configure_endpoint(slot_id: {}, raw_ep: {}, ep: {})", slot_id, endpoint_address, index);
+        // TODO: Rethink populate max_entries field
+        let current_entries = input_ctx.get_slot_mut().dword1.get_context_entries();
+        if index + 1 > current_entries {
+            input_ctx.get_slot_mut().dword1.set_context_entries(index + 1);
+        }
+
+        debug!("configure_endpoint(slot_id: {}, raw_ep: {}, index: {})", slot_id, endpoint_address, index);
 
         let epctx = input_ctx.get_endpoint_mut(index as usize);
+        if let Some(ctx) = self.device_contexts[slot_id as usize - 1].as_ref() {
+            *epctx = ctx.endpoint[index as usize].clone();
+        }
         epctx.set_lsa_bit(); // Disable Streams
         epctx.set_cerr(3); // Max value (2 bit only)
         epctx.set_ep_type(endpoint_type);
@@ -466,7 +475,6 @@ impl<'a> Xhci<'a> {
                 let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
                 lock.push(TRB { data });
             }
-
         }
         // Event Data TRB
         let mut event_data = EventDataTRB::default();
@@ -521,10 +529,9 @@ impl<'a> Xhci<'a> {
     }
 
     fn send_transfer(&mut self, slot_id: u8, endpoint: u8, request_type: u8, request: u8,
-                            value: u16, index: u16, length: u16, transfer: TransferDirection)
-                            -> Result<usize, &'static str>
+                     value: u16, index: u16, length: u16, transfer: TransferDirection)
+                     -> Result<usize, &'static str>
     {
-
         match &transfer {
             // TODO maybe don't always use DC CIVAC...
             TransferDirection::Read(read) => self.flush_slice(read, FlushType::Invalidate),
@@ -795,7 +802,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, &'static str> {
-        self.reset_port(&port);
+        self.reset_port(&port)?;
         let slot = self.send_slot_enable()? as usize;
         port.slot_id = slot as u8;
         info!("Got slot id: {}", slot);
@@ -908,7 +915,7 @@ impl<'a> Xhci<'a> {
 
                     for i in 0..20 {
                         let mut buf = Box::new([0u8; 128]);
-                        match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.num_if as u16, &mut buf[0..8]) {
+                        match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, &mut buf[0..8]) {
                             Ok(_) => {
                                 info!("got response: {:?}", &buf[0..8]);
                             }
@@ -927,10 +934,6 @@ impl<'a> Xhci<'a> {
 
                         self.hal.sleep(Duration::from_millis(500));
                     }
-
-
-
-
                 }
                 CLASS_CODE_HUB => {
                     if interface.endpoints.len() == 0 {
@@ -966,16 +969,36 @@ impl<'a> Xhci<'a> {
 
                     // Reconfigure to hub
                     {
-                        let slot_ctx = input_ctx.get_slot_mut();
+                        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+
+                        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
+                        let mut slot_ctx = input_ctx.get_slot_mut();
+                        *slot_ctx = ctx.slot.clone();
                         slot_ctx.dword1.set_hub(true);
                         slot_ctx.numbr_ports = hub_descriptor.num_ports;
+                        slot_ctx.slot_state = 0;
 
                         slot_ctx.interrupter_ttt = 3;
+
+                        input_ctx.get_input_mut()[1] = 1;
+
+                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+                        let ptr = self.command_ring.as_mut().expect("").push(
+                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
+                        );
+
+                        // self.wait_command_complete(ptr).expect("command_complete");
+                        // debug!("Slot Update");
+                        // self.hal.sleep(Duration::from_secs(1));
 
                         self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
                                                 interface.endpoints[0].address,
                                                 EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
                                                 interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
+
+                        input_ctx.set_configure_ep_meta(configuration.config.config_val,
+                                                        interface.interface.interface_number, interface.interface.alt_set);
 
                         // index 1 == add things bitfield.
                         input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
@@ -1286,6 +1309,9 @@ impl<'a> Xhci<'a> {
                 TRBType::CommandCompletion(c) => {
                     if c.trb_pointer == ptr {
                         debug!("Got command completion: {:?}", c);
+                        if c.code != 1 {
+                            panic!("EHHHH WTF")
+                        }
                         return Some(c);
                     } else {
                         debug!("trb_pointer badddddd: {:?}", c);
