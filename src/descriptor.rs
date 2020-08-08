@@ -27,6 +27,7 @@ impl USBDeviceDescriptor {
     pub fn get_max_packet_size(&self) -> u32 {
         match self.max_packet_size {
             8 => 8,
+            16 => 16,
             32 => 32,
             64 => 64,
             _ => 1u32 << self.max_packet_size,

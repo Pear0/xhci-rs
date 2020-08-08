@@ -390,17 +390,17 @@ impl<'a> Xhci<'a> {
             self.transfer_rings[slot_id as usize - 1].as_mut()
                 .expect("").push(TRB { data });
         }
-        // Event Data TRB
-        let mut event_data = EventDataTRB::default();
-        event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
-        self.transfer_rings[slot_id as usize - 1].as_mut()
-            .expect("").push(TRB { event_data });
         // Status TRB
         let mut status_stage = StatusStageTRB::default();
         status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
         status_stage.meta.set_ioc(true);
         self.transfer_rings[slot_id as usize - 1].as_mut()
             .expect("").push(TRB { status_stage });
+        // Event Data TRB
+        let mut event_data = EventDataTRB::default();
+        event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
+        self.transfer_rings[slot_id as usize - 1].as_mut()
+            .expect("").push(TRB { event_data });
 
         // Section 5.6: Table 5-43: Doorbell values
         self.get_doorbell_regster(slot_id).reg.write(1); // CTRL EP DB is 1
@@ -547,7 +547,7 @@ impl<'a> Xhci<'a> {
         let mut buf = [0u8; 8];
         self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_DEVICE,
                               0, 0, &mut buf)?;
-        self.reset_port(port_id);
+        self.reset_port(port_id)?;
         self.setup_slot(slot as u8, port_id, 0, false);
         let desc = self.fetch_device_descriptor(slot as u8)?;
         debug!("Device Descriptor: {:#?}", desc);
@@ -583,9 +583,8 @@ impl<'a> Xhci<'a> {
                 }
                 if interface.endpoints.len() > 1 {
                     warn!("Hub with more than 1 endpoint!");
+                    continue;
                 }
-
-                let endpoint = &interface.endpoints[0];
 
                 let mut hub_descriptor = USBHubDescriptor::default();
                 if desc.get_max_packet_size() >= 512 {
@@ -594,6 +593,31 @@ impl<'a> Xhci<'a> {
                     self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                 }
                 info!("Hub Descriptor: {:?}", hub_descriptor);
+
+                // Get Status
+                let mut buf = [0u8; 2];
+                self.send_control_command(slot as u8,
+                                          0x80,
+                                          0x0, // Get Status
+                                          0x0, 0x0,
+                                          2, None, Some(&mut buf),
+                )?;
+                debug!("Status Read back: {:?}", buf);
+
+                // Setup EPs
+                debug!("Found {} eps on this interface", interface.endpoints.len());
+
+                self.send_control_command(slot as u8, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
+                debug!("Applied Config {}", configuration.config.config_val);
+                self.reset_port(port_id)?;
+                let mut hub_descriptor = USBHubDescriptor::default();
+                if desc.get_max_packet_size() >= 512 {
+                    self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                } else {
+                    self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                }
+                info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
+
             }
         }
 
