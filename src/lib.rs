@@ -502,6 +502,7 @@ impl<'a> Xhci<'a> {
                 match trb {
                     TRBType::TransferEvent(t) => {
                         debug!("Transfer Complete: status = {}", t.status.get_code());
+                        assert_eq!(t.status.get_code(), 1, "transfer code error");
                         let bytes_remain = t.status.get_bytes_remain() as usize;
                         let bytes_requested = if write_to_usb.is_some() {
                             write_to_usb.unwrap().len()
@@ -997,7 +998,7 @@ impl<'a> Xhci<'a> {
 
                         slot_ctx.interrupter_ttt = 3;
 
-                        input_ctx.get_input_mut()[1] = 1;
+                        input_ctx.get_input_mut()[1] = 0b1;
 
                         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
                         self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
@@ -1005,9 +1006,19 @@ impl<'a> Xhci<'a> {
                             TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
                         );
 
-                        // self.wait_command_complete(ptr).expect("command_complete");
-                        // debug!("Slot Update");
-                        // self.hal.sleep(Duration::from_secs(1));
+                        self.wait_command_complete(ptr).expect("command_complete");
+                        debug!("Slot Update");
+                        self.hal.sleep(Duration::from_secs(1));
+
+                        // Config Endpoint
+                        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+                        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
+                        let mut slot_ctx = input_ctx.get_slot_mut();
+                        *slot_ctx = ctx.get_slot().clone();
+
+                        input_ctx.get_input_mut()[1] = 0b1001;
+                        // Clone CTRL EP
+                        *input_ctx.get_endpoint_mut(0) = ctx.get_endpoint(0).clone();
 
                         self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
                                                 interface.endpoints[0].address,
@@ -1032,7 +1043,7 @@ impl<'a> Xhci<'a> {
 
                     self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
                     debug!("Applied Config {}", configuration.config.config_val);
-                    // self.reset_port(port_id)?;
+
                     let mut hub_descriptor = USBHubDescriptor::default();
                     if desc.get_max_packet_size() >= 512 {
                         self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
