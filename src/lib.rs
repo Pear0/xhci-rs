@@ -451,17 +451,8 @@ impl<'a> Xhci<'a> {
                 let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
                 lock.push(TRB { data });
             }
-        }
-        // Status TRB
-        let mut status_stage = StatusStageTRB::default();
-        status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
-        status_stage.meta.set_ioc(true);
 
-        {
-            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-            lock.push(TRB { status_stage });
         }
-
         // Event Data TRB
         let mut event_data = EventDataTRB::default();
         event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
@@ -469,6 +460,16 @@ impl<'a> Xhci<'a> {
         {
             let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
             lock.push(TRB { event_data });
+        }
+        self.get_doorbell_regster(slot_id).reg.write(1); // CTRL EP DB is 1
+
+        // Status TRB
+        let mut status_stage = StatusStageTRB::default();
+        status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
+        status_stage.meta.set_ioc(true);
+        {
+            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+            lock.push(TRB { status_stage });
         }
 
         // Section 5.6: Table 5-43: Doorbell values
@@ -761,6 +762,7 @@ impl<'a> Xhci<'a> {
                     self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                 }
                 info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
+                self.hal.sleep(Duration::from_secs(1));
 
 
                 for num in 1..=hub_descriptor.num_ports {
