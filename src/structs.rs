@@ -250,9 +250,53 @@ impl InputContext {
 
 #[repr(C, align(2048))]
 #[derive(Default, Clone)]
-pub struct DeviceContextArray {
-    pub slot: SlotContext,
-    pub endpoint: [EndpointContext; 31],
+pub struct DeviceContextArrayTempl<S: Sized + Copy> {
+    slot: SlotContext,
+    __res0: S,
+    endpoint: [(EndpointContext, S); 31],
+}
+
+pub enum DeviceContextArray {
+    Normal(DeviceContextArrayTempl<[u8; 0]>),
+    Big(DeviceContextArrayTempl<[u8; 32]>),
+}
+
+impl DeviceContextArray {
+    pub fn new_normal() -> Self {
+        Self::Normal(DeviceContextArrayTempl::default())
+    }
+
+    pub fn new_big() -> Self {
+        Self::Big(DeviceContextArrayTempl::default())
+    }
+
+    pub fn get_slot_mut(&mut self) -> &mut SlotContext {
+        match self {
+            DeviceContextArray::Normal(c) => &mut c.slot,
+            DeviceContextArray::Big(c) => &mut c.slot,
+        }
+    }
+
+    pub fn get_endpoint_mut(&mut self, index: usize) -> &mut EndpointContext {
+        match self {
+            DeviceContextArray::Normal(c) => &mut c.endpoint[index].0,
+            DeviceContextArray::Big(c) => &mut c.endpoint[index].0,
+        }
+    }
+
+    pub fn get_ptr_va(&mut self) -> u64 {
+        match self {
+            DeviceContextArray::Normal(c) => c as *const DeviceContextArrayTempl<[u8; 0]> as u64,
+            DeviceContextArray::Big(c) => c as *const DeviceContextArrayTempl<[u8; 32]> as u64,
+        }
+    }
+
+    pub fn get_size(&mut self) -> usize {
+        match self {
+            DeviceContextArray::Normal(c) => core::mem::size_of_val(c),
+            DeviceContextArray::Big(c) => core::mem::size_of_val(c),
+        }
+    }
 }
 
 macro_rules! set_field {

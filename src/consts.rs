@@ -168,6 +168,7 @@ pub const REQUEST_SET_INTERFACE: u8 = 11;
 
 // HID
 pub const REQUEST_GET_REPORT: u8 = 1;
+pub const REQUEST_SET_IDLE: u8 = 0xA;
 pub const REQUEST_SET_PROTOCOL: u8 = 0xB;
 
 /* Hub Requests */

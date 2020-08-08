@@ -376,7 +376,7 @@ impl<'a> Xhci<'a> {
 
         let mut input_ctx = self.create_slot_contexts(port, speed, max_packet_size);
 
-        let mut dev_ctx = Box::new(DeviceContextArray::default());
+        let mut dev_ctx = Box::new(if self.info.big_context { DeviceContextArray::new_big() } else { DeviceContextArray::new_normal() });
         let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
@@ -663,6 +663,12 @@ impl<'a> Xhci<'a> {
         )
     }
 
+    fn set_hid_idle(&mut self, slot_id: u8) -> Result<usize, &'static str>
+    {
+        self.send_control_command(slot_id, 0x21, REQUEST_SET_IDLE, 0,
+                                  0, 0, None, None)
+    }
+
     fn set_hid_protocol(&mut self, slot_id: u8, value: u8) -> Result<usize, &'static str>
     {
         self.send_control_command(slot_id, 0x21, REQUEST_SET_PROTOCOL, value as u16,
@@ -887,6 +893,8 @@ impl<'a> Xhci<'a> {
                     self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
                     debug!("Applied Config {}", configuration.config.config_val);
 
+                    self.set_hid_idle(port.slot_id)?;
+
                     // 0 is Boot Protocol
                     self.set_hid_protocol(port.slot_id, 0)?;
 
@@ -902,6 +910,15 @@ impl<'a> Xhci<'a> {
                                 warn!("failed to read: {}", e);
                             }
                         }
+
+                        {
+                            let ring = self.transfer_rings.get(&(port.slot_id, index)).unwrap();
+                            let mut ring = ring.lock();
+                            while let Some(trb) = ring.pop(false) {
+                                debug!("Got keyboard interrupt trb: {:?}", unsafe { trb.normal } );
+                            }
+                        }
+
                         self.hal.sleep(Duration::from_millis(500));
                     }
 
