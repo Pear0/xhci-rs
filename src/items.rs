@@ -5,9 +5,28 @@ pub struct Port {
     pub port_id: u8,
     pub slot_id: u8,
     pub parent: Option<Box<Port>>,
+    pub is_low_or_full_speed: bool,
 }
 
 impl Port {
+    pub fn new_from_root(port_id: u8) -> Self {
+        Port {
+            port_id,
+            slot_id: 0,
+            parent: None,
+            is_low_or_full_speed: false,
+        }
+    }
+
+    pub fn child_port(&self, port_id: u8) -> Self {
+        Port {
+            port_id,
+            slot_id: 0,
+            parent: Some(Box::new(self.clone())),
+            is_low_or_full_speed: false,
+        }
+    }
+
     pub fn get_root_port_id(&self) -> u8 {
         match &self.parent {
             None => self.port_id,

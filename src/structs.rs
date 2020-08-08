@@ -321,8 +321,8 @@ pub struct SlotContext {
     pub root_hub_port_number: u8,
     pub numbr_ports: u8,
     // DWORD3
-    pub hub_slot_id: u8,
-    pub tt_port_number: u8,
+    pub parent_hub_slot_id: u8,
+    pub parent_port_number: u8,
     pub interrupter_ttt: u16,
     // DWORD 4
     pub device_addr: u8,

@@ -348,7 +348,14 @@ impl<'a> Xhci<'a> {
         input_ctx.get_slot_mut().dword1.set_speed(speed);
         input_ctx.get_slot_mut().dword1.set_context_entries(1); // TODO Maybe not hardcode 1?
         input_ctx.get_slot_mut().root_hub_port_number = port.get_root_port_id();
+        input_ctx.get_slot_mut().dword1.set_route_string(port.construct_route_string());
 
+        if let Some(parent) = port.parent.as_ref() {
+            if port.is_low_or_full_speed && !parent.is_low_or_full_speed {
+                input_ctx.get_slot_mut().parent_hub_slot_id = parent.slot_id;
+                input_ctx.get_slot_mut().parent_port_number = port.port_id;
+            }
+        }
 
         self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
                                 0, EP_TYPE_CONTROL_BIDIR, max_packet_size,
@@ -656,6 +663,10 @@ impl<'a> Xhci<'a> {
             _ => 512,
         };
 
+        if speed == OP_PORT_STATUS_SPEED_LOW || speed == OP_PORT_STATUS_SPEED_FULL {
+            port.is_low_or_full_speed = true;
+        }
+
         assert_ne!(slot, 0, "invalid slot 0 received");
         self.setup_slot(&port, speed, max_packet_size, true);
         let mut buf = [0u8; 8];
@@ -778,7 +789,7 @@ impl<'a> Xhci<'a> {
                         continue;
                     }
 
-                    let mut child_port = Port { port_id: num, slot_id: 0, parent: Some(Box::new(port.deref().clone())) };
+                    let mut child_port = port.child_port(num);
                     match self.setup_new_device(&mut child_port) {
                         Ok(_) => {}
                         Err(e) => {
@@ -1096,7 +1107,7 @@ impl<'a> Xhci<'a> {
 
         info!("Port {}: connected={}", port_id, ready);
         if ready {
-            let mut port = Port { port_id, slot_id: 0, parent: None };
+            let mut port = Port::new_from_root(port_id);
             if let Err(e) = self.setup_new_device(&mut port) {
                 error!("setup_new_device() err: {}", e);
             }
