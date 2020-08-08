@@ -219,6 +219,10 @@ impl InputContext {
         }
     }
 
+    pub fn set_configure_ep_meta(&mut self, config: u8, ifnum: u8, alt_set: u8) {
+        self.get_input_mut()[7] = config as u32 | (ifnum as u32) << 8 | (alt_set as u32) << 16;
+    }
+
     pub fn get_slot_mut(&mut self) -> &mut SlotContext {
         match self {
             InputContext::Normal(c) => &mut c.slot,

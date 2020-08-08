@@ -62,7 +62,7 @@ impl USBInterfaceDescriptorSet {
 pub struct USBInterfaceDescriptor {
     length: u8,
     pub descriptor_type: u8,
-    pub num_if: u8,
+    pub interface_number: u8,
     pub alt_set: u8,
     pub num_ep: u8,
     pub class: u8,
