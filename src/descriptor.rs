@@ -136,7 +136,7 @@ pub struct USBHubDescriptor {
     pub num_ports: u8,
     hub_chars: [u8; 2],
     // Power On to Power Good Time
-    potpgt: u8,
+    pub potpgt: u8,
     max_hub_current: u8,
 
     // "removable" and "power control mask" bitfields

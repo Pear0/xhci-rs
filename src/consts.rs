@@ -153,16 +153,22 @@ pub const EP_TYPE_BULK_IN: u8 = 6;
 pub const EP_TYPE_INTERRUPT_IN: u8 = 7;
 
 /* --------- Standard Requests ---------------- */
-pub const REQUEST_GET_STATUS :u8 = 0;
-pub const REQUEST_CLEAR_FEATURE :u8 = 1;
-pub const REQUEST_SET_FEATURE :u8 = 3;
-pub const REQUEST_SET_ADDRESS :u8 = 5;
-pub const REQUEST_GET_DESCRIPTOR :u8 = 6;
-pub const REQUEST_SET_DESCRIPTOR :u8 = 7;
-pub const REQUEST_GET_CONFIGURATION :u8 = 8;
-pub const REQUEST_SET_CONFIGURATION :u8 = 9;
-pub const REQUEST_GET_INTERFACE :u8 = 10;
-pub const REQUEST_SET_INTERFACE :u8 = 11;
+pub const REQUEST_GET_STATUS: u8 = 0;
+pub const REQUEST_CLEAR_FEATURE: u8 = 1;
+pub const REQUEST_SET_FEATURE: u8 = 3;
+pub const REQUEST_SET_ADDRESS: u8 = 5;
+pub const REQUEST_GET_DESCRIPTOR: u8 = 6;
+pub const REQUEST_SET_DESCRIPTOR: u8 = 7;
+pub const REQUEST_GET_CONFIGURATION: u8 = 8;
+pub const REQUEST_SET_CONFIGURATION: u8 = 9;
+pub const REQUEST_GET_INTERFACE: u8 = 10;
+pub const REQUEST_SET_INTERFACE: u8 = 11;
+
+/* Hub Requests */
+pub const REQUEST_CLEAR_TT_BUFFER: u8 = 8;
+pub const REQUEST_RESET_TT: u8 = 9;
+pub const REQUEST_GET_TT_STATE: u8 = 10;
+pub const REQUEST_STOP_TT: u8 = 11;
 
 pub const DESCRIPTOR_TYPE_DEVICE: u8 = 1;
 pub const DESCRIPTOR_TYPE_CONFIGURATION: u8 = 2;
@@ -177,3 +183,20 @@ pub const DESCRIPTOR_TYPE_SS_HUB: u8 = 0x2A;
 
 /* ---------- Class Codes ----------- */
 pub const CLASS_CODE_HUB: u8 = 9;
+
+/* ---------- Feature Selector --------- */
+pub const FEATURE_PORT_CONNECTION: u8 = 0x00;
+pub const FEATURE_PORT_ENABLE: u8 = 0x01;
+pub const FEATURE_PORT_SUSPEND: u8 = 0x02;
+pub const FEATURE_PORT_OVER_CURRENT: u8 = 0x03;
+pub const FEATURE_PORT_RESET: u8 = 0x04;
+pub const FEATURE_PORT_POWER: u8 = 0x08;
+pub const FEATURE_PORT_LOW_SPEED: u8 = 0x09;
+pub const FEATURE_C_PORT_CONNECTION: u8 = 0x10;
+pub const FEATURE_C_PORT_ENABLE: u8 = 0x11;
+pub const FEATURE_C_PORT_SUSPEND: u8 = 0x12;
+pub const FEATURE_C_PORT_OVER_CURRENT: u8 = 0x13;
+pub const FEATURE_C_PORT_RESET: u8 = 0x14;
+pub const FEATURE_PORT_TEST: u8 = 0x15;
+pub const FEATURE_PORT_INDICATOR: u8 = 0x16;
+

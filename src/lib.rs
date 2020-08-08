@@ -467,6 +467,24 @@ impl<'a> Xhci<'a> {
         )
     }
 
+    fn set_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, &'static str>
+    {
+        self.send_control_command(slot_id, 0x23, REQUEST_SET_FEATURE, feature as u16,
+                                  port_id as u16, 0, None, None)
+    }
+
+    fn clear_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, &'static str>
+    {
+        self.send_control_command(slot_id, 0x23, REQUEST_CLEAR_FEATURE, feature as u16,
+                                  port_id as u16, 0, None, None)
+    }
+
+    fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<[u8; 4], &'static str> {
+        let mut buf2 = [0u8; 4];
+        self.send_control_command(slot_id, 0xA3,  REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(&mut buf2))?;
+        Ok(buf2)
+    }
+
     fn fetch_device_descriptor(&mut self, slot_id: u8) -> Result<USBDeviceDescriptor, &'static str> {
         let mut buf2 = [0u8; 18];
         self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_DEVICE, 0, 0, &mut buf2)?;
@@ -667,6 +685,31 @@ impl<'a> Xhci<'a> {
                     self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                 }
                 info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
+
+
+                for num in 1..=hub_descriptor.num_ports {
+
+                    self.set_feature(slot as u8, num, FEATURE_PORT_POWER)?;
+
+                    self.hal.sleep(Duration::from_millis(hub_descriptor.potpgt as u64 * 2));
+
+                    self.clear_feature(slot as u8, num, FEATURE_C_PORT_CONNECTION)?;
+
+                    let status = self.fetch_port_status(slot as u8, num)?;
+
+                    debug!("Port {}: status={:#x?}", num, status);
+                }
+
+
+
+
+
+
+
+
+
+
+
             }
         }
 
