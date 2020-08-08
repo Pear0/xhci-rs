@@ -104,12 +104,19 @@ fn as_slice<T>(t: &mut T) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(t as *mut T as *mut u8, core::mem::size_of::<T>()) }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum FlushType {
+    Clean,
+    Invalidate,
+    CleanAndInvalidate,
+}
+
 pub trait HAL {
     fn current_time(&self) -> Duration;
     fn sleep(&self, dur: Duration);
     fn memory_barrier(&self);
     fn translate_addr(&self, addr: u64) -> u64;
-    fn flush_cache(&self, addr: u64, len: u64);
+    fn flush_cache(&self, addr: u64, len: u64, flush: FlushType);
 
     fn alloc_noncached(&self, layout: Layout) -> Option<u64> {
         Global.alloc(layout, AllocInit::Zeroed).ok().map(|x| x.ptr.as_ptr() as u64)
@@ -211,16 +218,16 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn flush_trb(&self, ptr: u64) {
-        self.hal.flush_cache(ptr, 16);
+    fn flush_trb(&self, ptr: u64, flush: FlushType) {
+        self.hal.flush_cache(ptr, 16, flush);
     }
 
-    fn flush_struct<T>(&self, val: &T) {
-        self.hal.flush_cache(val as *const T as u64, core::mem::size_of_val(val) as u64);
+    fn flush_struct<T>(&self, val: &T, flush: FlushType) {
+        self.hal.flush_cache(val as *const T as u64, core::mem::size_of_val(val) as u64, flush);
     }
 
-    fn flush_slice<T>(&self, val: &[T]) {
-        self.hal.flush_cache(val.as_ptr() as u64, core::mem::size_of_val(val) as u64);
+    fn flush_slice<T>(&self, val: &[T], flush: FlushType) {
+        self.hal.flush_cache(val.as_ptr() as u64, core::mem::size_of_val(val) as u64, flush);
     }
 
     pub fn reset(&mut self) -> Result<(), &'static str> {
@@ -380,14 +387,14 @@ impl<'a> Xhci<'a> {
         let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
-        self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref());
-        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+        self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref(), FlushType::Clean);
+        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
 
         // Activate Entry
         self.device_contexts[slot - 1] = Some(dev_ctx);
         self.device_context_baa.as_mut().expect("").entries[slot] = ctx_ptr;
 
-        self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap());
+        self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap(), FlushType::Clean);
 
         let ptr = self.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::address_device(slot as u8, input_ctx_ptr, block_cmd) }
@@ -402,12 +409,11 @@ impl<'a> Xhci<'a> {
                             -> Result<usize, &'static str>
     {
         if let Some(write) = write_to_usb {
-            self.flush_slice(write);
+            self.flush_slice(write, FlushType::Clean);
         }
 
-        // TODO maybe don't always use DC CIVAC...
         if let Some(read) = &read_from_usb {
-            self.flush_slice(read);
+            self.flush_slice(read, FlushType::Invalidate);
         }
 
         let setup_trt = if write_to_usb.is_none() && read_from_usb.is_none() {
@@ -498,7 +504,7 @@ impl<'a> Xhci<'a> {
                         };
 
                         if let Some(read) = read_from_usb {
-                            self.flush_slice(read);
+                            self.flush_slice(read, FlushType::Invalidate);
                         }
 
                         return Ok(bytes_requested - bytes_remain);
@@ -521,8 +527,8 @@ impl<'a> Xhci<'a> {
 
         match &transfer {
             // TODO maybe don't always use DC CIVAC...
-            TransferDirection::Read(read) => self.flush_slice(read),
-            TransferDirection::Write(write) => self.flush_slice(write),
+            TransferDirection::Read(read) => self.flush_slice(read, FlushType::Invalidate),
+            TransferDirection::Write(write) => self.flush_slice(write, FlushType::Clean),
             _ => {},
         }
 
@@ -620,7 +626,7 @@ impl<'a> Xhci<'a> {
                         };
 
                         if let TransferDirection::Read(read) = &transfer {
-                            self.flush_slice(read);
+                            self.flush_slice(read, FlushType::Invalidate);
                         }
 
                         return Ok(bytes_requested - bytes_remain);
@@ -878,7 +884,7 @@ impl<'a> Xhci<'a> {
                         input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
 
                         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
 
                         debug!("sending keyboard configure endpoint");
 
@@ -975,7 +981,7 @@ impl<'a> Xhci<'a> {
                         input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
 
                         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
 
                         let ptr = self.command_ring.as_mut().expect("").push(
                             TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
@@ -1148,7 +1154,7 @@ impl<'a> Xhci<'a> {
         }
 
         for i in 0..EVENT_RING_NUM_SEGMENTS {
-            self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64);
+            self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
         }
 
         let crcr_pa = self.get_ptr::<XHCIRingSegment>(self.command_ring.as_ref().unwrap().segments[0].as_ref());
@@ -1172,7 +1178,7 @@ impl<'a> Xhci<'a> {
             self.get_doorbell_register(0).reg.write(0);
             self.hal.memory_barrier();
             for i in 0..EVENT_RING_NUM_SEGMENTS {
-                self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64);
+                self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
             }
 
             let crcr = self.op.command_ring_control.read();
@@ -1195,7 +1201,7 @@ impl<'a> Xhci<'a> {
             ent.segments[idx].addr = pa;
         }
 
-        self.hal.flush_cache(self.event_ring_table.as_deref().unwrap() as *const EventRingSegmentTable as u64, core::mem::size_of::<EventRingSegmentTable>() as u64);
+        self.hal.flush_cache(self.event_ring_table.as_deref().unwrap() as *const EventRingSegmentTable as u64, core::mem::size_of::<EventRingSegmentTable>() as u64, FlushType::Clean);
 
         // Update Interrupter 0 Dequeu Pointer
         let dequeue_ptr_pa = self.get_ptr::<TRB>(&self.event_ring.as_ref().unwrap().segments[0].trbs[0]);

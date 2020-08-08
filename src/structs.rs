@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 use modular_bitfield::prelude::*;
 
 use crate::consts::*;
-use crate::HAL;
+use crate::{HAL, FlushType};
 use crate::trb::{LinkTRB, TRB};
 
 #[repr(C, align(2048))]
@@ -97,7 +97,7 @@ impl<'a> XHCIRing<'a> {
         }
 
         for seg in ring.segments.iter() {
-            hal.flush_cache(seg.as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64);
+            hal.flush_cache(seg.as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
         }
 
         ring
@@ -123,12 +123,12 @@ impl<'a> XHCIRing<'a> {
             }
             self.enqueue.1 = 0;
         }
-        self.hal.flush_cache(ptr_va, core::mem::size_of::<TRB>() as u64);
+        self.hal.flush_cache(ptr_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
         ptr_pa
     }
 
     pub fn pop(&mut self, has_link: bool) -> Option<TRB> {
-        self.hal.flush_cache((&self.segments[self.dequeue.0].trbs[self.dequeue.1]) as *const TRB as u64, 16);
+        self.hal.flush_cache((&self.segments[self.dequeue.0].trbs[self.dequeue.1]) as *const TRB as u64, 16, FlushType::Invalidate);
         let trb = self.segments[self.dequeue.0].trbs[self.dequeue.1].clone();
         if trb.get_cycle_state() != self.cycle_state as u8 {
             return None;
