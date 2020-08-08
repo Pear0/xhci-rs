@@ -271,11 +271,16 @@ pub struct EndpointContext {
     pub max_packet_size: u16,
     pub dequeu_pointer: u64,
     pub average_trb_len: u16,
-    max_esit_payload_lo: u16,
+    pub max_esit_payload_lo: u16,
     _res0: [u32; 3],
 }
 
 impl EndpointContext {
+    pub fn set_interval(&mut self, interval: u8) {
+        self.dword1 &= !EP_CTX_INTERVAL_MASK;
+        self.dword1 |= ((interval as u32) << EP_CTX_INTERVAL_SHIFT) & EP_CTX_INTERVAL_MASK;
+    }
+
     pub fn set_lsa_bit(&mut self) {
         self.dword1 |= EP_CTX_LSA_MASK;
     }

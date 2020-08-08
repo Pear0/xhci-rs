@@ -311,22 +311,36 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn configure_endpoint(&mut self, slot_id: u8, input_ctx: &mut InputContext, endpoint_id: u8, endpoint_type: u8, max_packet_size: u16) {
+    fn get_epctx_index(&self, endpoint_address: u8) -> u8 {
+        let is_in = (endpoint_address & 0x80 != 0);
+        if endpoint_address == 0 {
+            0
+        } else {
+            (endpoint_address * 2) - if is_in { 0 } else { 1 }
+        }
+    }
+
+    fn configure_endpoint(&mut self, slot_id: u8, input_ctx: &mut InputContext,
+                          endpoint_address: u8, endpoint_type: u8, max_packet_size: u16,
+                          interval: u8, esit_payload_size: u32) {
         let transfer_ring = XHCIRing::new_with_capacity(self.hal, 1, true);
         let transfer_ring_ptr = self.get_ptr::<XHCIRingSegment>(transfer_ring.segments[0].as_ref());
         assert_eq!(transfer_ring_ptr & 0b1111, 0, "alignment");
         trace!("[XHCI] Setting Transfer Ring Pointer to {:#x}", transfer_ring_ptr);
 
-        let epctx = &mut input_ctx.get_endpoint_mut(endpoint_id as usize);
+        let index = self.get_epctx_index(endpoint_address);
+        let epctx = input_ctx.get_endpoint_mut(index as usize);
         epctx.set_lsa_bit(); // Disable Streams
         epctx.set_cerr(3); // Max value (2 bit only)
         epctx.set_ep_type(endpoint_type);
+        epctx.set_interval(interval);
         assert_ne!(max_packet_size, 0);
         epctx.max_packet_size = max_packet_size;
-        epctx.average_trb_len = core::mem::size_of::<NormalTRB>() as u16;
-        epctx.dequeu_pointer = transfer_ring_ptr | 0x1; // Cycle Bit
+        epctx.average_trb_len = if endpoint_type == EP_TYPE_CONTROL_BIDIR { 8 } else { esit_payload_size as u16 };
+        epctx.max_esit_payload_lo = esit_payload_size as u16;
+        epctx.dequeu_pointer = transfer_ring_ptr | (transfer_ring.cycle_state & 0x1) as u64; // Cycle Bit
 
-        self.transfer_rings.insert((slot_id, endpoint_id), Arc::new(Mutex::new(transfer_ring)));
+        self.transfer_rings.insert((slot_id, index), Arc::new(Mutex::new(transfer_ring)));
     }
 
     fn create_slot_contexts(&mut self, port: &Port, speed: u8, max_packet_size: u16) -> Box<InputContext> {
@@ -336,7 +350,9 @@ impl<'a> Xhci<'a> {
         input_ctx.get_slot_mut().root_hub_port_number = port.get_root_port_id();
 
 
-        self.configure_endpoint(port.slot_id, input_ctx.as_mut(), 0, EP_TYPE_CONTROL_BIDIR, max_packet_size);
+        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
+                                0, EP_TYPE_CONTROL_BIDIR, max_packet_size,
+                                0, 0);
 
         input_ctx.get_input_mut()[1] = 0b11;
 
@@ -606,6 +622,20 @@ impl<'a> Xhci<'a> {
         Ok(USBConfigurationDescriptorSet { config, ifsets: interfaces })
     }
 
+    fn get_max_esti_payload(&self, epdesc: &USBEndpointDescriptor) -> u32 {
+        use crate::descriptor::USBEndpointTransferType;
+        match epdesc.transfer_type() {
+            USBEndpointTransferType::Control |
+            USBEndpointTransferType::Bulk => {
+                0
+            }
+            _ => {
+                let maxp_mult = (epdesc.max_packet_size >> 11) & 0x3;
+                maxp_mult as u32 * epdesc.max_packet_size as u32
+            }
+        }
+    }
+
     fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, &'static str> {
         self.reset_port(&port);
         let slot = self.send_slot_enable()? as usize;
@@ -703,16 +733,19 @@ impl<'a> Xhci<'a> {
 
                     slot_ctx.interrupter_ttt = 3;
 
-                    self.configure_endpoint(port.slot_id, input_ctx.as_mut(), interface.endpoints[0].get_endpoint_id(), EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size);
+                    self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
+                                            interface.endpoints[0].address,
+                                            EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
+                                            interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
 
                     // index 1 == add things bitfield.
-                    input_ctx.get_input_mut()[1] = 0b101;
+                    input_ctx.get_input_mut()[1] = 0b1001;
 
                     let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
                     self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
 
                     let ptr = self.command_ring.as_mut().expect("").push(
-                        TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr, false) }
+                        TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
                     );
                     self.wait_command_complete(ptr).expect("command_complete");
                 }

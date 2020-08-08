@@ -71,12 +71,21 @@ pub struct USBInterfaceDescriptor {
     pub ifstr_index: u8,
 }
 
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+pub enum USBEndpointTransferType {
+    Control = 0,
+    Isochronous = 1,
+    Bulk = 2,
+    Interrupt = 3
+}
+
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct USBEndpointDescriptor {
     length: u8,
     pub descriptor_type: u8,
-    address: u8,
+    pub address: u8,
     pub attr: u8,
     pub max_packet_size: u16,
     pub interval: u8,
@@ -90,6 +99,10 @@ impl USBEndpointDescriptor {
 
     pub fn is_input(&self) -> bool {
         (self.address & 0x80) != 0
+    }
+
+    pub fn transfer_type(&self) -> USBEndpointTransferType {
+        unsafe { core::mem::transmute(self.attr & 0x3 as u8) }
     }
 }
 
