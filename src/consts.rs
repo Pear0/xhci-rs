@@ -166,6 +166,10 @@ pub const REQUEST_SET_CONFIGURATION: u8 = 9;
 pub const REQUEST_GET_INTERFACE: u8 = 10;
 pub const REQUEST_SET_INTERFACE: u8 = 11;
 
+// HID
+pub const REQUEST_GET_REPORT: u8 = 1;
+pub const REQUEST_SET_PROTOCOL: u8 = 0xB;
+
 /* Hub Requests */
 pub const REQUEST_CLEAR_TT_BUFFER: u8 = 8;
 pub const REQUEST_RESET_TT: u8 = 9;
@@ -184,6 +188,7 @@ pub const DESCRIPTOR_TYPE_HUB: u8 = 0x29;
 pub const DESCRIPTOR_TYPE_SS_HUB: u8 = 0x2A;
 
 /* ---------- Class Codes ----------- */
+pub const CLASS_CODE_HID: u8 = 3;
 pub const CLASS_CODE_HUB: u8 = 9;
 
 /* ---------- Feature Selector --------- */

@@ -50,6 +50,10 @@ impl Port {
     }
 }
 
-
+pub enum TransferDirection<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+    None
+}
 
 

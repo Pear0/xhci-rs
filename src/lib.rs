@@ -27,10 +27,11 @@ use volatile::*;
 use crate::consts::*;
 use crate::descriptor::{USBConfigurationDescriptor, USBConfigurationDescriptorSet, USBDeviceDescriptor, USBEndpointDescriptor, USBHubDescriptor, USBInterfaceDescriptor, USBInterfaceDescriptorSet};
 use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
-use crate::items::Port;
+use crate::items::{Port, TransferDirection};
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, XHCIRing, XHCIRingSegment};
 use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TRB, TRBType};
+use crate::trb::TRBType::TransferEvent;
 
 #[macro_use]
 mod macros;
@@ -189,7 +190,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn get_doorbell_regster(&mut self, offset: u8) -> &'static mut DoorBellRegister {
+    fn get_doorbell_register(&mut self, offset: u8) -> &'static mut DoorBellRegister {
         let base_ptr = self.cap as *const XHCICapabilityRegisters as u64;
         unsafe {
             &mut *((base_ptr + (self.info.doorbell_offset as u64) +
@@ -329,6 +330,9 @@ impl<'a> Xhci<'a> {
         trace!("[XHCI] Setting Transfer Ring Pointer to {:#x}", transfer_ring_ptr);
 
         let index = self.get_epctx_index(endpoint_address);
+
+        debug!("configure_endpoint(slot_id: {}, raw_ep: {}, ep: {})", slot_id, endpoint_address, index);
+
         let epctx = input_ctx.get_endpoint_mut(index as usize);
         epctx.set_lsa_bit(); // Disable Streams
         epctx.set_cerr(3); // Max value (2 bit only)
@@ -476,7 +480,7 @@ impl<'a> Xhci<'a> {
         }
 
         // Section 5.6: Table 5-43: Doorbell values
-        self.get_doorbell_regster(slot_id).reg.write(1); // CTRL EP DB is 1
+        self.get_doorbell_register(slot_id).reg.write(1); // CTRL EP DB is 1
 
         loop {
             let result = self.poll_event_ring_trb();
@@ -510,6 +514,128 @@ impl<'a> Xhci<'a> {
         }
     }
 
+    fn send_transfer(&mut self, slot_id: u8, endpoint: u8, request_type: u8, request: u8,
+                            value: u16, index: u16, length: u16, transfer: TransferDirection)
+                            -> Result<usize, &'static str>
+    {
+
+        match &transfer {
+            // TODO maybe don't always use DC CIVAC...
+            TransferDirection::Read(read) => self.flush_slice(read),
+            TransferDirection::Write(write) => self.flush_slice(write),
+            _ => {},
+        }
+
+        let setup_trt = match &transfer {
+            TransferDirection::Read(_) => 3,
+            TransferDirection::Write(_) => 2,
+            TransferDirection::None => 0,
+        };
+
+        let mut setup = SetupStageTRB {
+            request_type,
+            request,
+            value,
+            index,
+            length,
+            int_target_trb_length: Default::default(),
+            metadata: Default::default(),
+        };
+        setup.metadata.set_imm(true);
+        setup.metadata.set_trb_type(TRB_TYPE_SETUP as u8);
+        setup.metadata.set_trt(setup_trt);
+        setup.int_target_trb_length.set_trb_length(8); // Always 8: Section 6.4.1.2.1, Table 6-25
+
+        {
+            let ring = self.transfer_rings.get(&(slot_id, endpoint)).ok_or("unknown (slot, endpoint)")?;
+            let mut ring = ring.lock();
+            ring.push(TRB { setup });
+        }
+
+        if !matches!(&transfer, TransferDirection::None) {
+            // Data TRB
+            let mut data = DataStageTRB::default();
+
+            match &transfer {
+                TransferDirection::Read(read) => {
+                    data.buffer = self.hal.translate_addr(read.as_ptr() as u64);
+                }
+                TransferDirection::Write(write) => {
+                    data.buffer = self.hal.translate_addr(write.as_ptr() as u64);
+                }
+                TransferDirection::None => panic!(),
+            }
+
+            data.params.set_transfer_size(match &transfer {
+                TransferDirection::Read(read) => read.len() as u32,
+                TransferDirection::Write(write) => write.len() as u32,
+                TransferDirection::None => 0,
+            });
+            data.meta.set_read(matches!(&transfer, TransferDirection::Read(_)));
+            data.meta.set_trb_type(TRB_TYPE_DATA as u8);
+            data.meta.set_eval_next(true);
+            data.meta.set_chain(true);
+
+            {
+                let ring = self.transfer_rings.get(&(slot_id, endpoint)).ok_or("unknown (slot, endpoint)")?;
+                let mut ring = ring.lock();
+                ring.push(TRB { data });
+            }
+        }
+        // Status TRB
+        let mut status_stage = StatusStageTRB::default();
+        status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
+        status_stage.meta.set_ioc(true);
+
+        {
+            let ring = self.transfer_rings.get(&(slot_id, endpoint)).ok_or("unknown (slot, endpoint)")?;
+            let mut ring = ring.lock();
+            ring.push(TRB { status_stage });
+        }
+
+        // Event Data TRB
+        let mut event_data = EventDataTRB::default();
+        event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
+
+        {
+            let ring = self.transfer_rings.get(&(slot_id, endpoint)).ok_or("unknown (slot, endpoint)")?;
+            let mut ring = ring.lock();
+            ring.push(TRB { event_data });
+        }
+
+
+        // Section 5.6: Table 5-43: Doorbell values
+        self.get_doorbell_register(slot_id).reg.write(1); // CTRL EP DB is 1
+
+        loop {
+            let result = self.poll_event_ring_trb();
+            if let Some(trb) = result {
+                match trb {
+                    TRBType::TransferEvent(t) => {
+                        let bytes_remain = t.status.get_bytes_remain() as usize;
+                        let bytes_requested = match &transfer {
+                            TransferDirection::Read(read) => read.len(),
+                            TransferDirection::Write(write) => write.len(),
+                            TransferDirection::None => 0,
+                        };
+
+                        if let TransferDirection::Read(read) = &transfer {
+                            self.flush_slice(read);
+                        }
+
+                        return Ok(bytes_requested - bytes_remain);
+                    }
+                    _ => {
+                        debug!("[XHCI] Unexpected TRB: {:?}", &trb);
+                    }
+                }
+            } else {
+                error!("[XHCI] Poll TRB timedout");
+                return Err("USBError::ControlEndpointTimeout");
+            }
+        }
+    }
+
     fn fetch_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
                         w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
     {
@@ -526,6 +652,21 @@ impl<'a> Xhci<'a> {
                                   ((desc_type as u16) << 8) | (desc_index as u16),
                                   w_index, buf.len() as u16, None, Some(buf),
         )
+    }
+
+    fn fetch_hid_report(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
+                        w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
+    {
+        self.send_control_command(slot_id, 0xA1, REQUEST_GET_REPORT,
+                                  ((desc_type as u16) << 8) | (desc_index as u16),
+                                  w_index, buf.len() as u16, None, Some(buf),
+        )
+    }
+
+    fn set_hid_protocol(&mut self, slot_id: u8, value: u8) -> Result<usize, &'static str>
+    {
+        self.send_control_command(slot_id, 0x21, REQUEST_SET_PROTOCOL, value as u16,
+                                  0, 0, None, None)
     }
 
     fn set_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, &'static str>
@@ -703,100 +844,166 @@ impl<'a> Xhci<'a> {
                 debug!("Skipping non-default altSetting Interface");
                 continue;
             }
-            if interface.interface.class == CLASS_CODE_HUB {
-                if interface.endpoints.len() == 0 {
-                    warn!("Hub with no endpoints!");
-                    continue;
-                }
-                if interface.endpoints.len() > 1 {
-                    warn!("Hub with more than 1 endpoint!");
-                    continue;
-                }
-
-                let mut hub_descriptor = USBHubDescriptor::default();
-                if desc.get_max_packet_size() >= 512 {
-                    self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-                } else {
-                    self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-                }
-                info!("Hub Descriptor: {:?}", hub_descriptor);
-
-                // Get Status
-                let mut buf = [0u8; 2];
-                self.send_control_command(port.slot_id,
-                                          0x80,
-                                          0x0, // Get Status
-                                          0x0, 0x0,
-                                          2, None, Some(&mut buf),
-                )?;
-                debug!("Status Read back: {:?}", buf);
-
-                // Setup EPs
-                debug!("Found {} eps on this interface", interface.endpoints.len());
-
-
-                // Reconfigure to hub
-                {
-                    let slot_ctx = input_ctx.get_slot_mut();
-                    slot_ctx.dword1.set_hub(true);
-                    slot_ctx.numbr_ports = hub_descriptor.num_ports;
-
-                    slot_ctx.interrupter_ttt = 3;
-
-                    self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
-                                            interface.endpoints[0].address,
-                                            EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
-                                            interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
-
-                    // index 1 == add things bitfield.
-                    input_ctx.get_input_mut()[1] = 0b1001;
-
-                    let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                    self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
-
-                    let ptr = self.command_ring.as_mut().expect("").push(
-                        TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
-                    );
-                    self.wait_command_complete(ptr).expect("command_complete");
-                }
-
-
-                self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
-                debug!("Applied Config {}", configuration.config.config_val);
-                // self.reset_port(port_id)?;
-                let mut hub_descriptor = USBHubDescriptor::default();
-                if desc.get_max_packet_size() >= 512 {
-                    self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-                } else {
-                    self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-                }
-                info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
-                self.hal.sleep(Duration::from_secs(1));
-
-
-                for num in 1..=hub_descriptor.num_ports {
-                    self.set_feature(port.slot_id, num, FEATURE_PORT_POWER)?;
-
-                    self.hal.sleep(Duration::from_millis(hub_descriptor.potpgt as u64 * 2));
-
-                    self.clear_feature(port.slot_id, num, FEATURE_C_PORT_CONNECTION)?;
-
-                    let status = self.fetch_port_status(slot as u8, num)?;
-
-                    debug!("Port {}: status={:?}", num, status);
-
-                    if !status.get_device_connected() {
+            match interface.interface.class {
+                CLASS_CODE_HID => {
+                    if interface.interface.sub_class != 1 {
+                        debug!("Skipping non bios-mode HID device");
                         continue;
                     }
 
-                    let mut child_port = port.child_port(num);
-                    match self.setup_new_device(&mut child_port) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("Failed to configure child of port {}: {}", port.port_id, e);
+                    if interface.interface.protocol != 1 {
+                        debug!("Skipping non keyboard");
+                        continue;
+                    }
+
+                    if interface.endpoints.len() == 0 {
+                        warn!("keyboard with no endpoints!");
+                        continue;
+                    }
+
+                    // Enable keyboard
+                    {
+                        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
+                                                interface.endpoints[0].address,
+                                                EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
+                                                interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
+
+                        // index 1 == add things bitfield.
+                        input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
+
+                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+
+                        debug!("sending keyboard configure endpoint");
+
+                        let ptr = self.command_ring.as_mut().expect("").push(
+                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
+                        );
+                        self.wait_command_complete(ptr).expect("command_complete");
+
+                        debug!("done keyboard configure endpoint");
+                    }
+
+                    self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
+                    debug!("Applied Config {}", configuration.config.config_val);
+
+                    // 0 is Boot Protocol
+                    self.set_hid_protocol(port.slot_id, 0)?;
+
+                    let index = self.get_epctx_index(interface.endpoints[0].address);
+
+                    for i in 0..20 {
+                        let mut buf = Box::new([0u8; 128]);
+                        match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.num_if as u16, &mut buf[0..8]) {
+                            Ok(_) => {
+                                info!("got response: {:?}", &buf[0..8]);
+                            }
+                            Err(e) => {
+                                warn!("failed to read: {}", e);
+                            }
+                        }
+                        self.hal.sleep(Duration::from_millis(500));
+                    }
+
+
+
+
+                }
+                CLASS_CODE_HUB => {
+                    if interface.endpoints.len() == 0 {
+                        warn!("Hub with no endpoints!");
+                        continue;
+                    }
+                    if interface.endpoints.len() > 1 {
+                        warn!("Hub with more than 1 endpoint!");
+                        continue;
+                    }
+
+                    let mut hub_descriptor = USBHubDescriptor::default();
+                    if desc.get_max_packet_size() >= 512 {
+                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                    } else {
+                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                    }
+                    info!("Hub Descriptor: {:?}", hub_descriptor);
+
+                    // Get Status
+                    let mut buf = [0u8; 2];
+                    self.send_control_command(port.slot_id,
+                                              0x80,
+                                              0x0, // Get Status
+                                              0x0, 0x0,
+                                              2, None, Some(&mut buf),
+                    )?;
+                    debug!("Status Read back: {:?}", buf);
+
+                    // Setup EPs
+                    debug!("Found {} eps on this interface", interface.endpoints.len());
+
+
+                    // Reconfigure to hub
+                    {
+                        let slot_ctx = input_ctx.get_slot_mut();
+                        slot_ctx.dword1.set_hub(true);
+                        slot_ctx.numbr_ports = hub_descriptor.num_ports;
+
+                        slot_ctx.interrupter_ttt = 3;
+
+                        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
+                                                interface.endpoints[0].address,
+                                                EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
+                                                interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
+
+                        // index 1 == add things bitfield.
+                        input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
+
+                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+
+                        let ptr = self.command_ring.as_mut().expect("").push(
+                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
+                        );
+                        self.wait_command_complete(ptr).expect("command_complete");
+                    }
+
+
+                    self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
+                    debug!("Applied Config {}", configuration.config.config_val);
+                    // self.reset_port(port_id)?;
+                    let mut hub_descriptor = USBHubDescriptor::default();
+                    if desc.get_max_packet_size() >= 512 {
+                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                    } else {
+                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                    }
+                    info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
+
+
+                    for num in 1..=hub_descriptor.num_ports {
+                        self.set_feature(port.slot_id, num, FEATURE_PORT_POWER)?;
+
+                        self.hal.sleep(Duration::from_millis(hub_descriptor.potpgt as u64 * 2));
+
+                        self.clear_feature(port.slot_id, num, FEATURE_C_PORT_CONNECTION)?;
+
+                        let status = self.fetch_port_status(slot as u8, num)?;
+
+                        debug!("Port {}: status={:?}", num, status);
+
+                        if !status.get_device_connected() {
+                            continue;
+                        }
+
+                        let mut child_port = port.child_port(num);
+                        match self.setup_new_device(&mut child_port) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!("Failed to configure child of port {}: {}", port.port_id, e);
+                            }
                         }
                     }
                 }
+                _ => {}
             }
         }
 
@@ -945,7 +1152,7 @@ impl<'a> Xhci<'a> {
             self.hal.memory_barrier();
             self.op.command_ring_control.write(val64);
             self.hal.memory_barrier();
-            self.get_doorbell_regster(0).reg.write(0);
+            self.get_doorbell_register(0).reg.write(0);
             self.hal.memory_barrier();
             for i in 0..EVENT_RING_NUM_SEGMENTS {
                 self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64);
@@ -1049,7 +1256,7 @@ impl<'a> Xhci<'a> {
     fn wait_command_complete(&mut self, ptr: u64) -> Option<CommandCompletionTRB> {
         self.hal.memory_barrier();
         // TODO update this code to use interrupt notification system
-        self.get_doorbell_regster(0).reg.write(0);
+        self.get_doorbell_register(0).reg.write(0);
         loop {
             let trb = self.poll_event_ring_trb()?;
             match trb {
