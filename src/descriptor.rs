@@ -76,12 +76,22 @@ pub struct USBInterfaceDescriptor {
 pub struct USBEndpointDescriptor {
     length: u8,
     pub descriptor_type: u8,
-    pub address: u8,
+    address: u8,
     pub attr: u8,
     pub max_packet_size: u16,
     pub interval: u8,
 }
 const_assert_size!(USBEndpointDescriptor, 7);
+
+impl USBEndpointDescriptor {
+    pub fn get_endpoint_id(&self) -> u8 {
+        self.address & 0xF
+    }
+
+    pub fn is_input(&self) -> bool {
+        (self.address & 0x80) != 0
+    }
+}
 
 #[derive(Debug)]
 #[repr(C)]

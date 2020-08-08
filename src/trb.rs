@@ -215,6 +215,20 @@ impl CommandTRB {
         }
         trb
     }
+
+    pub fn configure_endpoint(slot: u8, context_ptr: u64, block: bool) -> Self {
+        let mut trb = Self::default();
+        trb.payload[3] |= (TRB_TYPE_CONFIG_ENDPOINT_CMD as u32) << TRB_COMMON_TYPE_SHIFT as u32;
+        assert_eq!(context_ptr & 0b1111, 0, "alignment");
+        trb.payload[0] = context_ptr as u32;
+        trb.payload[1] = (context_ptr >> 32) as u32;
+        trb.payload[3] |= (slot as u32) << 24;
+        if block {
+            trb.payload[3] |= 1u32 << 9;
+        }
+        trb
+    }
+
 }
 
 impl Into<TRB> for CommandTRB {

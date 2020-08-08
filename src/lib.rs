@@ -14,18 +14,21 @@ extern crate log;
 use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::time::Duration;
 
+use hashbrown::HashMap;
+use spin::Mutex;
 use volatile::*;
 
 use crate::consts::*;
+use crate::descriptor::{USBConfigurationDescriptor, USBConfigurationDescriptorSet, USBDeviceDescriptor, USBEndpointDescriptor, USBHubDescriptor, USBInterfaceDescriptor, USBInterfaceDescriptorSet};
 use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
-use crate::structs::{DeviceContextBaseAddressArray, EventRingSegmentTable, ScratchPadBufferArray, XHCIRing, XHCIRingSegment, DeviceContextArray, InputContext};
-use crate::trb::{CommandCompletionTRB, CommandTRB, TRB, TRBType, SetupStageTRB, DataStageTRB, EventDataTRB, StatusStageTRB};
-use crate::descriptor::{USBDeviceDescriptor, USBConfigurationDescriptor, USBInterfaceDescriptor, USBEndpointDescriptor, USBConfigurationDescriptorSet, USBInterfaceDescriptorSet, USBHubDescriptor};
+use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, ScratchPadBufferArray, XHCIRing, XHCIRingSegment};
+use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, SetupStageTRB, StatusStageTRB, TRB, TRBType, NormalTRB};
 
 #[macro_use]
 mod macros;
@@ -123,8 +126,11 @@ pub struct Xhci<'a> {
     info: XHCIInfo,
     device_context_baa: Option<Box<DeviceContextBaseAddressArray>>,
     device_contexts: [Option<Box<DeviceContextArray>>; 255],
-    transfer_rings: [Option<XHCIRing<'a>>; 255],
-    command_ring: Option<XHCIRing<'a>>,
+
+    // (slot, endpoint)
+    transfer_rings: HashMap<(u8, u8), Arc<Mutex<XHCIRing<'a>>>>,
+
+    command_ring: Option < XHCIRing < 'a > >,
     event_ring: Option<XHCIRing<'a>>,
     event_ring_table: Option<Box<EventRingSegmentTable>>,
     scratchpads: Option<Box<ScratchPadBufferArray>>,
@@ -164,7 +170,7 @@ impl<'a> Xhci<'a> {
             info,
             device_context_baa: None,
             device_contexts: [None; 255],
-            transfer_rings: [None; 255],
+            transfer_rings: HashMap::new(),
             command_ring: None,
             event_ring: None,
             event_ring_table: None,
@@ -262,72 +268,64 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn setup_slot(&mut self, slot: u8, port_id: u8, max_packet_size: u16, block_cmd: bool) {
-        // TODO Cleanup we should not destroy dca because it gets called again;
-        let slot = slot as usize;
-        let mut dev_ctx = Box::new(DeviceContextArray::default());
-        let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
+    fn configure_endpoint(&mut self, slot_id: u8, input_ctx: &mut InputContext, endpoint_id: u8, endpoint_type: u8, max_packet_size: u16) {
 
         let transfer_ring = XHCIRing::new_with_capacity(self.hal, 1, true);
         let transfer_ring_ptr = self.get_ptr::<XHCIRingSegment>(transfer_ring.segments[0].as_ref());
         assert_eq!(transfer_ring_ptr & 0b1111, 0, "alignment");
         trace!("[XHCI] Setting Transfer Ring Pointer to {:#x}", transfer_ring_ptr);
 
-        // Setup Slot Context
-        let portsc = self.op.get_port_operational_register(port_id).portsc.read();
-        let speed = ((portsc & OP_PORT_STATUS_SPEED_MASK) >> OP_PORT_STATUS_SPEED_SHIFT) as u8;
-        dev_ctx.slot.dword1.set_speed(speed);
-        dev_ctx.slot.dword1.set_context_entries(1); // TODO Maybe not hardcode 1?
-        dev_ctx.slot.root_hub_port_number = port_id;
-
-        // Setup first EP Slot
-        let epctx = &mut dev_ctx.endpoint[0];
+        let epctx = &mut input_ctx.get_endpoint_mut(endpoint_id as usize);
         epctx.set_lsa_bit(); // Disable Streams
         epctx.set_cerr(3); // Max value (2 bit only)
-        epctx.set_ep_type(EP_TYPE_CONTROL_BIDIR);
-        if max_packet_size == 0 {
-            epctx.max_packet_size = match speed {
-                0 => {
-                    error!("[XHCI] unknown device speed on port {}", port_id);
-                    64
-                }
-                OP_PORT_STATUS_SPEED_LOW => 8,
-                OP_PORT_STATUS_SPEED_FULL |
-                OP_PORT_STATUS_SPEED_HIGH => 64,
-                _ => 512,
-            };
-        } else {
-            epctx.max_packet_size = max_packet_size;
-        }
-        epctx.average_trb_len = 8;
+        epctx.set_ep_type(endpoint_type);
+        assert_ne!(max_packet_size, 0);
+        epctx.max_packet_size = max_packet_size;
+        epctx.average_trb_len = core::mem::size_of::<NormalTRB>() as u16;
         epctx.dequeu_pointer = transfer_ring_ptr | 0x1; // Cycle Bit
-        trace!("[XHCI] speed after reset, {}, {:x}", speed, portsc);
+
+        self.transfer_rings.insert((slot_id, endpoint_id), Arc::new(Mutex::new(transfer_ring)));
+
+    }
+
+    fn create_slot_contexts(&mut self, slot_id: u8, port_id: u8, speed: u8, max_packet_size: u16) -> Box<InputContext> {
 
         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
-        *input_ctx.get_slot_mut() = dev_ctx.slot.clone();
-        for i in 0..31 {
-            *input_ctx.get_endpoint_mut(i) = dev_ctx.endpoint[i].clone();
-        }
+        input_ctx.get_slot_mut().dword1.set_speed(speed);
+        input_ctx.get_slot_mut().dword1.set_context_entries(1); // TODO Maybe not hardcode 1?
+        input_ctx.get_slot_mut().root_hub_port_number = port_id;
+
+        self.configure_endpoint(slot_id, input_ctx.as_mut(), 0, EP_TYPE_CONTROL_BIDIR, max_packet_size);
+
         input_ctx.get_input_mut()[1] = 0b11;
 
-        *dev_ctx = DeviceContextArray::default();
+        input_ctx
+    }
+
+    fn setup_slot(&mut self, slot: u8, port_id: u8, speed: u8, max_packet_size: u16, block_cmd: bool) -> Box<InputContext> {
+        // TODO Cleanup we should not destroy dca because it gets called again;
+        let slot = slot as usize;
+
+        let mut input_ctx = self.create_slot_contexts(slot as u8, port_id, speed, max_packet_size);
+
+        let mut dev_ctx = Box::new(DeviceContextArray::default());
+        let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
         self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref());
+        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
 
         // Activate Entry
         self.device_contexts[slot - 1] = Some(dev_ctx);
         self.device_context_baa.as_mut().expect("").entries[slot] = ctx_ptr;
-        self.transfer_rings[slot - 1] = Some(transfer_ring);
 
         self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap());
-        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
 
         let ptr = self.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::address_device(slot as u8, input_ctx_ptr, block_cmd) }
         );
         self.wait_command_complete(ptr).expect("command_complete");
-        core::mem::drop(input_ctx); // Don't early drop
+        input_ctx
     }
 
     fn send_control_command(&mut self, slot_id: u8, request_type: u8, request: u8,
@@ -366,8 +364,12 @@ impl<'a> Xhci<'a> {
         setup.metadata.set_trb_type(TRB_TYPE_SETUP as u8);
         setup.metadata.set_trt(setup_trt);
         setup.int_target_trb_length.set_trb_length(8); // Always 8: Section 6.4.1.2.1, Table 6-25
-        self.transfer_rings[slot_id as usize - 1].as_mut()
-            .expect("").push(TRB { setup });
+        // self.transfer_rings[slot_id as usize - 1].as_mut()
+        //     .expect("").push(TRB { setup });
+        {
+            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+            lock.push(TRB { setup });
+        }
 
         if write_to_usb.is_some() || read_from_usb.is_some() {
             // Data TRB
@@ -387,20 +389,31 @@ impl<'a> Xhci<'a> {
             data.meta.set_trb_type(TRB_TYPE_DATA as u8);
             data.meta.set_eval_next(true);
             data.meta.set_chain(true);
-            self.transfer_rings[slot_id as usize - 1].as_mut()
-                .expect("").push(TRB { data });
+
+            {
+                let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+                lock.push(TRB { data });
+            }
+
         }
         // Status TRB
         let mut status_stage = StatusStageTRB::default();
         status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
         status_stage.meta.set_ioc(true);
-        self.transfer_rings[slot_id as usize - 1].as_mut()
-            .expect("").push(TRB { status_stage });
+
+        {
+            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+            lock.push(TRB { status_stage });
+        }
+
         // Event Data TRB
         let mut event_data = EventDataTRB::default();
         event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
-        self.transfer_rings[slot_id as usize - 1].as_mut()
-            .expect("").push(TRB { event_data });
+
+        {
+            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+            lock.push(TRB { event_data });
+        }
 
         // Section 5.6: Table 5-43: Doorbell values
         self.get_doorbell_regster(slot_id).reg.write(1); // CTRL EP DB is 1
@@ -542,13 +555,26 @@ impl<'a> Xhci<'a> {
 
         // Ok(slot as u8)
 
+        let portsc = self.op.get_port_operational_register(port_id).portsc.read();
+        let speed = ((portsc & OP_PORT_STATUS_SPEED_MASK) >> OP_PORT_STATUS_SPEED_SHIFT) as u8;
+        let max_packet_size = match speed {
+            0 => {
+                error!("[XHCI] unknown device speed on port {}", port_id);
+                64
+            }
+            OP_PORT_STATUS_SPEED_LOW => 8,
+            OP_PORT_STATUS_SPEED_FULL |
+            OP_PORT_STATUS_SPEED_HIGH => 64,
+            _ => 512,
+        };
+
         assert_ne!(slot, 0, "invalid slot 0 received");
-        self.setup_slot(slot as u8, port_id, 0, true);
+        self.setup_slot(slot as u8, port_id, speed, max_packet_size, true);
         let mut buf = [0u8; 8];
         self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_DEVICE,
                               0, 0, &mut buf)?;
         self.reset_port(port_id)?;
-        self.setup_slot(slot as u8, port_id, 0, false);
+        let mut input_ctx = self.setup_slot(slot as u8, port_id, speed, max_packet_size, false);
         let desc = self.fetch_device_descriptor(slot as u8)?;
         debug!("Device Descriptor: {:#?}", desc);
         let mut buf = [0u8; 2];
@@ -607,9 +633,33 @@ impl<'a> Xhci<'a> {
                 // Setup EPs
                 debug!("Found {} eps on this interface", interface.endpoints.len());
 
+
+                // Reconfigure to hub
+                {
+                    let slot_ctx = input_ctx.get_slot_mut();
+                    slot_ctx.dword1.set_hub(true);
+                    slot_ctx.numbr_ports = hub_descriptor.num_ports;
+
+                    slot_ctx.interrupter_ttt = 3;
+
+                    self.configure_endpoint(slot as u8, input_ctx.as_mut(), interface.endpoints[0].get_endpoint_id(), EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size);
+
+                    // index 1 == add things bitfield.
+                    input_ctx.get_input_mut()[1] = 0b101;
+
+                    let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+                    self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+
+                    let ptr = self.command_ring.as_mut().expect("").push(
+                        TRB { command: CommandTRB::configure_endpoint(slot as u8, input_ctx_ptr, false) }
+                    );
+                    self.wait_command_complete(ptr).expect("command_complete");
+                }
+
+
                 self.send_control_command(slot as u8, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
                 debug!("Applied Config {}", configuration.config.config_val);
-                self.reset_port(port_id)?;
+                // self.reset_port(port_id)?;
                 let mut hub_descriptor = USBHubDescriptor::default();
                 if desc.get_max_packet_size() >= 512 {
                     self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
@@ -617,7 +667,6 @@ impl<'a> Xhci<'a> {
                     self.fetch_class_descriptor(slot as u8, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                 }
                 info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
-
             }
         }
 
