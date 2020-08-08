@@ -348,7 +348,7 @@ impl<'a> Xhci<'a> {
 
         let epctx = input_ctx.get_endpoint_mut(index as usize);
         if let Some(ctx) = self.device_contexts[slot_id as usize - 1].as_ref() {
-            *epctx = ctx.endpoint[index as usize].clone();
+            *epctx = ctx.get_endpoint(index as usize).clone();
         }
         epctx.set_lsa_bit(); // Disable Streams
         epctx.set_cerr(3); // Max value (2 bit only)
@@ -882,10 +882,27 @@ impl<'a> Xhci<'a> {
 
                     // Enable keyboard
                     {
+                        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+
+                        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
+                        let mut slot_ctx = input_ctx.get_slot_mut();
+                        *slot_ctx = ctx.get_slot().clone();
+
+                        input_ctx.get_input_mut()[1] = 1;
+
+                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+                        let ptr = self.command_ring.as_mut().expect("").push(
+                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
+                        );
+
                         self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
                                                 interface.endpoints[0].address,
                                                 EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
                                                 interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
+
+                        input_ctx.set_configure_ep_meta(configuration.config.config_val,
+                                                        interface.interface.interface_number, interface.interface.alt_set);
 
                         // index 1 == add things bitfield.
                         input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
@@ -973,7 +990,7 @@ impl<'a> Xhci<'a> {
 
                         let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
                         let mut slot_ctx = input_ctx.get_slot_mut();
-                        *slot_ctx = ctx.slot.clone();
+                        *slot_ctx = ctx.get_slot().clone();
                         slot_ctx.dword1.set_hub(true);
                         slot_ctx.numbr_ports = hub_descriptor.num_ports;
                         slot_ctx.slot_state = 0;
@@ -983,7 +1000,7 @@ impl<'a> Xhci<'a> {
                         input_ctx.get_input_mut()[1] = 1;
 
                         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64);
+                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
                         let ptr = self.command_ring.as_mut().expect("").push(
                             TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
                         );

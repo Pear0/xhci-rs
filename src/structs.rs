@@ -274,10 +274,24 @@ impl DeviceContextArray {
         Self::Big(DeviceContextArrayTempl::default())
     }
 
+    pub fn get_slot(&self) -> &SlotContext {
+        match self {
+            DeviceContextArray::Normal(c) => &c.slot,
+            DeviceContextArray::Big(c) => &c.slot,
+        }
+    }
+
     pub fn get_slot_mut(&mut self) -> &mut SlotContext {
         match self {
             DeviceContextArray::Normal(c) => &mut c.slot,
             DeviceContextArray::Big(c) => &mut c.slot,
+        }
+    }
+
+    pub fn get_endpoint(&self, index: usize) -> &EndpointContext {
+        match self {
+            DeviceContextArray::Normal(c) => &c.endpoint[index].0,
+            DeviceContextArray::Big(c) => &c.endpoint[index].0,
         }
     }
 
