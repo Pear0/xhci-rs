@@ -144,7 +144,7 @@ impl fmt::Debug for USBHubDescriptorData {
 #[derive(Debug, Default)]
 #[repr(C)]
 pub struct USBHubDescriptor {
-    length: u8,
+    pub length: u8,
     pub descriptor_type: u8,
     pub num_ports: u8,
     hub_chars: [u8; 2],
@@ -155,7 +155,5 @@ pub struct USBHubDescriptor {
     // "removable" and "power control mask" bitfields
     data: USBHubDescriptorData,
 }
-
-const_assert_size!(USBHubDescriptor, 71);
 
 

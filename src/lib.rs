@@ -460,16 +460,30 @@ impl<'a> Xhci<'a> {
             } else {
                 self.hal.translate_addr(read_from_usb.as_ref().unwrap().as_ptr() as u64)
             };
-            data.params.set_transfer_size(
-                if write_to_usb.is_some() {
-                    write_to_usb.as_ref().unwrap().len() as u32
-                } else {
-                    read_from_usb.as_ref().unwrap().len() as u32
-                });
+            let transfer_size = if write_to_usb.is_some() {
+                write_to_usb.as_ref().unwrap().len() as u32
+            } else {
+                read_from_usb.as_ref().unwrap().len() as u32
+            };
+            assert_eq!(transfer_size, length as u32);
+            data.params.set_transfer_size(transfer_size);
+
+            // Calculate TDSize
+            let max = (1u32 << (21 - 17 + 1)) - 1;
+            let td_size = if (transfer_size >> 10) >= max {
+                max
+            } else {
+                (transfer_size >> 10)
+            };
+            data.params.set_td_size(td_size as u8);
+
+            if read_from_usb.is_some() {
+                data.meta.set_isp(true); // Interrupt on Short Packet only for IN
+            }
             data.meta.set_read(read_from_usb.is_some());
             data.meta.set_trb_type(TRB_TYPE_DATA as u8);
-            data.meta.set_eval_next(true);
-            data.meta.set_chain(true);
+            // data.meta.set_eval_next(true);
+            // data.meta.set_chain(true);
 
             {
                 let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
@@ -501,8 +515,12 @@ impl<'a> Xhci<'a> {
             if let Some(trb) = result {
                 match trb {
                     TRBType::TransferEvent(t) => {
-                        debug!("Transfer Complete: status = {}", t.status.get_code());
-                        assert_eq!(t.status.get_code(), 1, "transfer code error");
+                        debug!("Transfer Complete: status = {:?}", unsafe { core::mem::transmute::<u8, TRBCompletionCode>(t.status.get_code())});
+                        if t.status.get_code() != TRBCompletionCode::ShortPacket as u8 {
+                            assert_eq!(t.status.get_code(), 1, "transfer code error");
+                        } else {
+                            warn!("ControlMessage Short Packet Detected, {:?}", t);
+                        }
                         let bytes_remain = t.status.get_bytes_remain() as usize;
                         let bytes_requested = if write_to_usb.is_some() {
                             write_to_usb.unwrap().len()
@@ -537,7 +555,7 @@ impl<'a> Xhci<'a> {
             // TODO maybe don't always use DC CIVAC...
             TransferDirection::Read(read) => self.flush_slice(read, FlushType::Invalidate),
             TransferDirection::Write(write) => self.flush_slice(write, FlushType::Clean),
-            _ => {},
+            _ => {}
         }
 
         let setup_trt = match &transfer {
@@ -918,7 +936,8 @@ impl<'a> Xhci<'a> {
                         );
                         self.wait_command_complete(ptr).expect("command_complete");
 
-                        debug!("done keyboard configure endpoint");
+                        debug!("done keyboard                     self.hal.sleep(Duration::from_secs(3));
+configure endpoint");
                     }
 
                     self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
@@ -946,7 +965,7 @@ impl<'a> Xhci<'a> {
                             let ring = self.transfer_rings.get(&(port.slot_id, index)).unwrap();
                             let mut ring = ring.lock();
                             while let Some(trb) = ring.pop(false) {
-                                debug!("Got keyboard interrupt trb: {:?}", unsafe { trb.normal } );
+                                debug!("Got keyboard interrupt trb: {:?}", unsafe { trb.normal });
                             }
                         }
 
@@ -964,22 +983,24 @@ impl<'a> Xhci<'a> {
                     }
 
                     let mut hub_descriptor = USBHubDescriptor::default();
+                    let mut descriptor_length: usize = 0;
                     if desc.get_max_packet_size() >= 512 {
                         self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                     } else {
                         self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                     }
+                    descriptor_length = hub_descriptor.length as usize;
                     info!("Hub Descriptor: {:?}", hub_descriptor);
 
-                    // Get Status
-                    let mut buf = [0u8; 2];
-                    self.send_control_command(port.slot_id,
-                                              0x80,
-                                              0x0, // Get Status
-                                              0x0, 0x0,
-                                              2, None, Some(&mut buf),
-                    )?;
-                    debug!("Status Read back: {:?}", buf);
+                    // // Get Status
+                    // let mut buf = [0u8; 2];
+                    // self.send_control_command(port.slot_id,
+                    //                           0x80,
+                    //                           0x0, // Get Status
+                    //                           0x0, 0x0,
+                    //                           2, None, Some(&mut buf),
+                    // )?;
+                    // debug!("Status Read back: {:?}", buf);
 
                     // Setup EPs
                     debug!("Found {} eps on this interface", interface.endpoints.len());
@@ -1008,7 +1029,6 @@ impl<'a> Xhci<'a> {
 
                         self.wait_command_complete(ptr).expect("command_complete");
                         debug!("Slot Update");
-                        self.hal.sleep(Duration::from_secs(1));
 
                         // Config Endpoint
                         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
@@ -1040,15 +1060,16 @@ impl<'a> Xhci<'a> {
                         self.wait_command_complete(ptr).expect("command_complete");
                     }
 
+                    debug!("slot state = {}", self.device_contexts[port.slot_id as usize - 1].as_ref().unwrap().get_slot().slot_state);
 
-                    self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
+                    self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
                     debug!("Applied Config {}", configuration.config.config_val);
 
                     let mut hub_descriptor = USBHubDescriptor::default();
                     if desc.get_max_packet_size() >= 512 {
                         self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
                     } else {
-                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
+                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, &mut as_slice(&mut hub_descriptor)[..descriptor_length])?;
                     }
                     info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
 

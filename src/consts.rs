@@ -136,6 +136,7 @@ pub const SLOT_CTX_SPEED_SHIFT: u32 = 20;
 pub const SLOT_CTX_SPEED_MASK: u32 = 0xF << SLOT_CTX_SPEED_SHIFT;
 pub const SLOT_CTX_ENTRYS_SHIFT: u32 = 27;
 pub const SLOT_CTX_ENTRYS_MASK: u32 = 0x1F << SLOT_CTX_ENTRYS_SHIFT;
+
 /* ------------- XHCI EP Context --------------- */
 pub const EP_CTX_LSA_MASK: u32 = 0x1 << 15;
 pub const EP_CTX_CERR_SHIFT: u8 = 1;
@@ -153,6 +154,48 @@ pub const EP_TYPE_CONTROL_BIDIR: u8 = 4;
 pub const EP_TYPE_ISOCH_IN: u8 = 5;
 pub const EP_TYPE_BULK_IN: u8 = 6;
 pub const EP_TYPE_INTERRUPT_IN: u8 = 7;
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+pub enum TRBCompletionCode {
+    Invalid = 0,
+    Success,
+    DataBufferErr,
+    BabbleDetectedErr,
+    USBTransactionErr,
+    TRBErr,
+    StallErr,
+    ResourceErr,
+    BandwidthErr,
+    NoSlotsErr,
+    InvalidStreamType,
+    SlotNotEnabledErr,
+    EPNotEnabledErr,
+    ShortPacket,
+    RingUnderrun,
+    RingOverrun,
+    VFEventRingFullErr,
+    ParamErr,
+    BandwidthOverrun,
+    ContextStateErr,
+    NoPingResponseErr,
+    EventRingFullErr,
+    IncompatibleDevice,
+    MissedService,
+    CommandRingStoppedErr,
+    CommandAborted,
+    Stopped,
+    StoppedLengthInvalid,
+    StoppedShortPacket,
+    MaxExitLatencyTooLarge,
+    Reserved,
+    IsochBufferOverrun,
+    EventLost,
+    UndefinedErr,
+    InvalidStreamID,
+    SecondaryBandwidthErr,
+    SplitTransactionErr,
+}
 
 /* --------- Standard Requests ---------------- */
 pub const REQUEST_GET_STATUS: u8 = 0;
