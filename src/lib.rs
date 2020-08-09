@@ -32,10 +32,12 @@ use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, XHCIRing, XHCIRingSegment};
 use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TRB, TRBType};
 use crate::trb::TRBType::TransferEvent;
+use crate::quirks::XHCIQuirks;
 
 #[macro_use]
 mod macros;
 
+pub mod quirks;
 pub(crate) mod consts;
 pub(crate) mod descriptor;
 pub(crate) mod extended_capability;
@@ -145,6 +147,7 @@ pub struct Xhci<'a> {
     event_ring: Option<XHCIRing<'a>>,
     event_ring_table: Option<Box<EventRingSegmentTable>>,
     scratchpads: Option<Box<ScratchPadBufferArray>>,
+    pub quirks: XHCIQuirks,
 }
 
 #[derive(Default)]
@@ -186,6 +189,7 @@ impl<'a> Xhci<'a> {
             event_ring: None,
             event_ring_table: None,
             scratchpads: None,
+            quirks: Default::default(),
         }
     }
 
@@ -862,8 +866,11 @@ impl<'a> Xhci<'a> {
 
         debug!("First descriptor: {:?}", &buf);
 
-        self.reset_port(&port)?;
-        let mut input_ctx = self.setup_slot(&port, speed, max_packet_size, false);
+        if !self.quirks.no_reset_before_address_device {
+            self.reset_port(&port)?;
+        }
+
+        self.setup_slot(&port, speed, max_packet_size, false);
         let desc = self.fetch_device_descriptor(port.slot_id)?;
         debug!("Device Descriptor: {:#?}", desc);
         let mut buf = [0u8; 2];
@@ -945,8 +952,7 @@ impl<'a> Xhci<'a> {
                         );
                         self.wait_command_complete(ptr).expect("command_complete");
 
-                        debug!("done keyboard                     self.hal.sleep(Duration::from_secs(3));
-configure endpoint");
+                        debug!("done keyboard configure endpoint");
                     }
 
                     self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
