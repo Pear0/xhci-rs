@@ -103,7 +103,15 @@ impl<'a> XHCIRing<'a> {
         ring
     }
 
-    pub fn push(&mut self, mut trb: TRB) -> u64 {
+    fn swap_cycle(v: u8) -> u8 {
+        if v == 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn do_push(&mut self, mut trb: TRB) -> u64 {
         assert_ne!(self.segments.len(), 0, "no segments");
         trb.set_cycle_state(self.cycle_state as u8);
         self.segments[self.enqueue.0].trbs[self.enqueue.1] = trb;
@@ -118,13 +126,17 @@ impl<'a> XHCIRing<'a> {
                 // Toggle Cycle State
                 debug!("[XHCI] Toggling State");
                 self.segments[self.enqueue.0].trbs[TRBS_PER_SEGMENT - 1].set_cycle_state(self.cycle_state as u8);
-                self.cycle_state = if self.cycle_state == 0 { 1 } else { 0 };
+                self.cycle_state = Self::swap_cycle(self.cycle_state as u8) as u32;
                 self.enqueue.0 = 0;
             }
             self.enqueue.1 = 0;
         }
         self.hal.flush_cache(ptr_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
         ptr_pa
+    }
+
+    pub fn push(&mut self, mut trb: TRB) -> u64 {
+        self.do_push(trb)
     }
 
     pub fn pop(&mut self, has_link: bool) -> Option<TRB> {

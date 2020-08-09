@@ -491,12 +491,12 @@ impl<'a> Xhci<'a> {
             }
         }
         // Event Data TRB
-        let mut event_data = EventDataTRB::default();
-        event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
-        {
-            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-            lock.push(TRB { event_data });
-        }
+        // let mut event_data = EventDataTRB::default();
+        // event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
+        // {
+        //     let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+        //     lock.push(TRB { event_data });
+        // }
 
         // Status TRB
         let mut status_stage = StatusStageTRB::default();
@@ -605,8 +605,9 @@ impl<'a> Xhci<'a> {
             });
             data.meta.set_read(matches!(&transfer, TransferDirection::Read(_)));
             data.meta.set_trb_type(TRB_TYPE_DATA as u8);
-            data.meta.set_eval_next(true);
-            data.meta.set_chain(true);
+            // TODO sketchies
+            // data.meta.set_eval_next(true);
+            // data.meta.set_chain(true);
 
             {
                 let ring = self.transfer_rings.get(&(slot_id, endpoint)).ok_or("unknown (slot, endpoint)")?;
@@ -693,6 +694,14 @@ impl<'a> Xhci<'a> {
                                   ((desc_type as u16) << 8) | (desc_index as u16),
                                   w_index, buf.len() as u16, None, Some(buf),
         )
+    }
+
+    fn set_hid_report(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
+                      w_index: u16, value: u8) -> Result<usize, &'static str>
+    {
+        self.send_control_command(slot_id, 0x21, REQUEST_SET_REPORT,
+                                  ((desc_type as u16) << 8) | (desc_index as u16),
+                                  w_index, 1, Some(core::slice::from_ref(&value)), None)
     }
 
     fn set_hid_idle(&mut self, slot_id: u8) -> Result<usize, &'static str>
@@ -915,16 +924,16 @@ impl<'a> Xhci<'a> {
                             TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
                         );
 
-                        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
-                                                interface.endpoints[0].address,
-                                                EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
-                                                interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
+                        // self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
+                        //                         interface.endpoints[0].address,
+                        //                         EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
+                        //                         interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
 
                         input_ctx.set_configure_ep_meta(configuration.config.config_val,
                                                         interface.interface.interface_number, interface.interface.alt_set);
 
                         // index 1 == add things bitfield.
-                        input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
+                        input_ctx.get_input_mut()[1] = 1; // | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
 
                         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
                         self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
@@ -943,14 +952,23 @@ configure endpoint");
                     self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
                     debug!("Applied Config {}", configuration.config.config_val);
 
-                    self.set_hid_idle(port.slot_id)?;
-
                     // 0 is Boot Protocol
                     self.set_hid_protocol(port.slot_id, 0)?;
+
+                    self.set_hid_idle(port.slot_id)?;
 
                     let index = self.get_epctx_index(interface.endpoints[0].address);
 
                     for i in 0..20 {
+                        match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
+                            Ok(_) => {
+                                info!("set_hid success");
+                            }
+                            Err(e) => {
+                                warn!("set_hid: failed to read: {}", e);
+                            }
+                        }
+
                         let mut buf = Box::new([0u8; 128]);
                         match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, &mut buf[0..8]) {
                             Ok(_) => {
@@ -961,13 +979,13 @@ configure endpoint");
                             }
                         }
 
-                        {
-                            let ring = self.transfer_rings.get(&(port.slot_id, index)).unwrap();
-                            let mut ring = ring.lock();
-                            while let Some(trb) = ring.pop(false) {
-                                debug!("Got keyboard interrupt trb: {:?}", unsafe { trb.normal });
-                            }
-                        }
+                        // {
+                        //     let ring = self.transfer_rings.get(&(port.slot_id, index)).unwrap();
+                        //     let mut ring = ring.lock();
+                        //     while let Some(trb) = ring.pop(false) {
+                        //         debug!("Got keyboard interrupt trb: {:?}", unsafe { trb.normal });
+                        //     }
+                        // }
 
                         self.hal.sleep(Duration::from_millis(500));
                     }
@@ -1017,7 +1035,7 @@ configure endpoint");
                         slot_ctx.numbr_ports = hub_descriptor.num_ports;
                         slot_ctx.slot_state = 0;
 
-                        slot_ctx.interrupter_ttt = 3;
+                        slot_ctx.interrupter_ttt = 0;
 
                         input_ctx.get_input_mut()[1] = 0b1;
 
