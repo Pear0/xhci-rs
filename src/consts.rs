@@ -156,7 +156,7 @@ pub const EP_TYPE_BULK_IN: u8 = 6;
 pub const EP_TYPE_INTERRUPT_IN: u8 = 7;
 
 #[repr(u8)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum TRBCompletionCode {
     Invalid = 0,
     Success,
@@ -195,6 +195,17 @@ pub enum TRBCompletionCode {
     InvalidStreamID,
     SecondaryBandwidthErr,
     SplitTransactionErr,
+
+    OtherReserved,
+}
+
+impl From<u8> for TRBCompletionCode {
+    fn from(value: u8) -> Self {
+        if value >= TRBCompletionCode::OtherReserved as u8 {
+            return TRBCompletionCode::OtherReserved
+        }
+        unsafe { core::mem::transmute(value) }
+    }
 }
 
 /* --------- Standard Requests ---------------- */
@@ -218,6 +229,7 @@ pub const REQUEST_SET_PROTOCOL: u8 = 0xB;
 /* Hub Requests */
 pub const REQUEST_CLEAR_TT_BUFFER: u8 = 8;
 pub const REQUEST_RESET_TT: u8 = 9;
+pub const REQUEST_RESET_TT_DEFAULT_TT: u16 = 1;
 pub const REQUEST_GET_TT_STATE: u8 = 10;
 pub const REQUEST_STOP_TT: u8 = 11;
 

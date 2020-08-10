@@ -111,9 +111,13 @@ impl<'a> XHCIRing<'a> {
         }
     }
 
-    fn do_push(&mut self, mut trb: TRB) -> u64 {
+    fn do_push(&mut self, mut trb: TRB, flip_cycle: bool) -> (u64, u64) {
         assert_ne!(self.segments.len(), 0, "no segments");
-        trb.set_cycle_state(self.cycle_state as u8);
+        if flip_cycle {
+            trb.set_cycle_state(Self::swap_cycle(self.cycle_state as u8));
+        } else {
+            trb.set_cycle_state(self.cycle_state as u8);
+        }
         self.segments[self.enqueue.0].trbs[self.enqueue.1] = trb;
         let ptr_va = &self.segments[self.enqueue.0].trbs[self.enqueue.1] as *const TRB as u64;
         let ptr_pa = self.hal.translate_addr(ptr_va);
@@ -132,11 +136,31 @@ impl<'a> XHCIRing<'a> {
             self.enqueue.1 = 0;
         }
         self.hal.flush_cache(ptr_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
-        ptr_pa
+        (ptr_va, ptr_pa)
     }
 
     pub fn push(&mut self, mut trb: TRB) -> u64 {
-        self.do_push(trb)
+        self.do_push(trb, false).1
+    }
+
+    pub fn push_group(&mut self, trbs: &[TRB]) {
+        assert_ne!(trbs.len(), 0);
+
+        let mut first_va = 0;
+
+        for (i, trb) in trbs.iter().enumerate() {
+            let va = self.do_push(trb.clone(), i == 0).0;
+            if i == 0 {
+                first_va = va;
+            }
+        }
+
+        assert_ne!(first_va, 0);
+
+        let mut first = unsafe { &mut *(first_va as *mut TRB) };
+        first.set_cycle_state(Self::swap_cycle(first.get_cycle_state()));
+
+        self.hal.flush_cache(first_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
     }
 
     pub fn pop(&mut self, has_link: bool) -> Option<TRB> {

@@ -46,6 +46,18 @@ pub(crate) mod registers;
 pub(crate) mod structs;
 pub(crate) mod trb;
 
+#[derive(Clone, Debug)]
+pub enum Error {
+    Str(&'static str),
+    Completion(TRBCompletionCode),
+}
+
+impl From<&'static str> for Error {
+    fn from(s: &'static str) -> Self {
+        Error::Str(s)
+    }
+}
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct XHCICapabilityRegisters {
@@ -234,11 +246,11 @@ impl<'a> Xhci<'a> {
         self.hal.flush_cache(val.as_ptr() as u64, core::mem::size_of_val(val) as u64, flush);
     }
 
-    pub fn reset(&mut self) -> Result<(), &'static str> {
+    pub fn reset(&mut self) -> Result<(), Error> {
         self.op.command.update(|x| *x |= OP_CMD_RESET_MASK);
         self.hal.memory_barrier();
 
-        self.wait_until("did not reset", RESET_TIMEOUT, |this| {
+        self.wait_until(Error::Str("did not reset"), RESET_TIMEOUT, |this| {
             let cmd = this.op.command.read();
             let sts = this.op.status.read();
             (cmd & OP_CMD_RESET_MASK == 0) && (sts & OP_STS_CNR_MASK == 0)
@@ -251,13 +263,13 @@ impl<'a> Xhci<'a> {
         self.hal.translate_addr(t as *const T as u64)
     }
 
-    fn do_reset_root_port(&mut self, port_id: u8) -> Result<(), &'static str> {
+    fn do_reset_root_port(&mut self, port_id: u8) -> Result<(), Error> {
         self.op.get_port_operational_register(port_id).portsc.update(|tmp| {
             *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
             *tmp |= OP_PORT_STATUS_RESET_MASK | OP_PORT_STATUS_PRC_MASK;
         });
 
-        self.wait_until("failed to reset port", PORT_RESET_TIMEOUT, |this| {
+        self.wait_until(Error::Str("failed to reset port"), PORT_RESET_TIMEOUT, |this| {
             let val = this.op.get_port_operational_register(port_id).portsc.read();
             (val & OP_PORT_STATUS_RESET_MASK == 0) && (OP_PORT_STATUS_PRC_MASK != 0)
         })?;
@@ -271,7 +283,7 @@ impl<'a> Xhci<'a> {
         Ok(())
     }
 
-    fn reset_port(&mut self, port: &Port) -> Result<(), &'static str> {
+    fn reset_port(&mut self, port: &Port) -> Result<(), Error> {
         match &port.parent {
             None => self.do_reset_root_port(port.port_id),
             Some(parent) => {
@@ -287,12 +299,15 @@ impl<'a> Xhci<'a> {
 
                 self.clear_feature(parent.slot_id, port.port_id, FEATURE_C_PORT_RESET)?;
 
+                // self.reset_tt(parent.slot_id, REQUEST_RESET_TT_DEFAULT_TT)?;
+                // self.hal.sleep(Duration::from_millis(15));
+
                 Ok(())
             }
         }
     }
 
-    fn get_speed(&mut self, port: &Port) -> Result<u8, &'static str> {
+    fn get_speed(&mut self, port: &Port) -> Result<u8, Error> {
         match &port.parent {
             None => {
                 let portsc = self.op.get_port_operational_register(port.port_id).portsc.read();
@@ -311,7 +326,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn send_slot_enable(&mut self) -> Result<u8, &'static str> {
+    fn send_slot_enable(&mut self) -> Result<u8, Error> {
         let cmd = CommandTRB::enable_slot();
         let ptr = self.command_ring.as_mut()
             .expect("no cmd ring found").push(cmd.into());
@@ -319,7 +334,7 @@ impl<'a> Xhci<'a> {
 
         match self.wait_command_complete(ptr) {
             Some(trb) => Ok(trb.slot),
-            _ => Err("USBError::CommandTimeout")
+            _ => Err("USBError::CommandTimeout".into())
         }
     }
 
@@ -391,6 +406,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn setup_slot(&mut self, port: &Port, speed: u8, max_packet_size: u16, block_cmd: bool) -> Box<InputContext> {
+        debug!("setup_slot(port_id: {}, speed: {}, max_packet_size: {}, block_cmd: {})", port.port_id, speed, max_packet_size, block_cmd);
         // TODO Cleanup we should not destroy dca because it gets called again;
         let slot = port.slot_id as usize;
 
@@ -413,20 +429,28 @@ impl<'a> Xhci<'a> {
             TRB { command: CommandTRB::address_device(slot as u8, input_ctx_ptr, block_cmd) }
         );
         self.wait_command_complete(ptr).expect("command_complete");
+
+        self.hal.sleep(Duration::from_millis(10));
+
         input_ctx
     }
 
     fn send_control_command(&mut self, slot_id: u8, request_type: u8, request: u8,
                             value: u16, index: u16, length: u16,
                             write_to_usb: Option<&[u8]>, read_from_usb: Option<&mut [u8]>)
-                            -> Result<usize, &'static str>
+                            -> Result<usize, Error>
     {
+        let mut trbs: Vec<TRB> = Vec::new();
+        let mut min_length = length;
+
         if let Some(write) = write_to_usb {
             self.flush_slice(write, FlushType::Clean);
+            min_length = core::cmp::min(min_length, write.len() as u16);
         }
 
         if let Some(read) = &read_from_usb {
             self.flush_slice(read, FlushType::Invalidate);
+            min_length = core::cmp::min(min_length, read.len() as u16);
         }
 
         let setup_trt = if write_to_usb.is_none() && read_from_usb.is_none() {
@@ -436,14 +460,14 @@ impl<'a> Xhci<'a> {
         } else if read_from_usb.is_some() && write_to_usb.is_none() {
             3u8
         } else {
-            return Err("USBError::InvalidArgument");
+            return Err("USBError::InvalidArgument".into());
         };
         let mut setup = SetupStageTRB {
             request_type,
             request,
             value,
             index,
-            length,
+            length: min_length,
             int_target_trb_length: Default::default(),
             metadata: Default::default(),
         };
@@ -451,10 +475,7 @@ impl<'a> Xhci<'a> {
         setup.metadata.set_trb_type(TRB_TYPE_SETUP as u8);
         setup.metadata.set_trt(setup_trt);
         setup.int_target_trb_length.set_trb_length(8); // Always 8: Section 6.4.1.2.1, Table 6-25
-        {
-            let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-            lock.push(TRB { setup });
-        }
+        trbs.push(TRB { setup });
 
         if write_to_usb.is_some() || read_from_usb.is_some() {
             // Data TRB
@@ -464,21 +485,11 @@ impl<'a> Xhci<'a> {
             } else {
                 self.hal.translate_addr(read_from_usb.as_ref().unwrap().as_ptr() as u64)
             };
-            let transfer_size = if write_to_usb.is_some() {
-                write_to_usb.as_ref().unwrap().len() as u32
-            } else {
-                read_from_usb.as_ref().unwrap().len() as u32
-            };
-            assert_eq!(transfer_size, length as u32);
-            data.params.set_transfer_size(transfer_size);
+            data.params.set_transfer_size(min_length as u32);
 
             // Calculate TDSize
             let max = (1u32 << (21 - 17 + 1)) - 1;
-            let td_size = if (transfer_size >> 10) >= max {
-                max
-            } else {
-                (transfer_size >> 10)
-            };
+            let td_size = core::cmp::min((min_length as u32) >> 10, max);
             data.params.set_td_size(td_size as u8);
 
             if read_from_usb.is_some() {
@@ -489,10 +500,7 @@ impl<'a> Xhci<'a> {
             // data.meta.set_eval_next(true);
             // data.meta.set_chain(true);
 
-            {
-                let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-                lock.push(TRB { data });
-            }
+            trbs.push(TRB { data });
         }
         // Event Data TRB
         // let mut event_data = EventDataTRB::default();
@@ -506,9 +514,16 @@ impl<'a> Xhci<'a> {
         let mut status_stage = StatusStageTRB::default();
         status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
         status_stage.meta.set_ioc(true);
+        if !(min_length > 0 && read_from_usb.is_some()) {
+            // status stage read is the reverse of the data stage read.
+            // See Table 4-7 in the Intel xHCI manual
+            status_stage.meta.set_read(true);
+        }
+        trbs.push(TRB { status_stage });
+
         {
             let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-            lock.push(TRB { status_stage });
+            lock.push_group(trbs.as_slice());
         }
 
         // Section 5.6: Table 5-43: Doorbell values
@@ -519,9 +534,18 @@ impl<'a> Xhci<'a> {
             if let Some(trb) = result {
                 match trb {
                     TRBType::TransferEvent(t) => {
-                        debug!("Transfer Complete: status = {:?}", unsafe { core::mem::transmute::<u8, TRBCompletionCode>(t.status.get_code())});
+                        let code = TRBCompletionCode::from(t.status.get_code());
+                        debug!("Transfer Complete: status = {:?}", code);
                         if t.status.get_code() != TRBCompletionCode::ShortPacket as u8 {
-                            assert_eq!(t.status.get_code(), 1, "transfer code error");
+                            if !matches!(code, TRBCompletionCode::Success) {
+
+                                {
+                                    let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
+                                    lock.push_group(trbs.as_slice());
+                                }
+
+                                return Err(Error::Completion(code));
+                            }
                         } else {
                             warn!("ControlMessage Short Packet Detected, {:?}", t);
                         }
@@ -546,14 +570,14 @@ impl<'a> Xhci<'a> {
                 }
             } else {
                 error!("[XHCI] Poll TRB timedout");
-                return Err("USBError::ControlEndpointTimeout");
+                return Err(Error::Str("USBError::ControlEndpointTimeout"));
             }
         }
     }
 
     fn send_transfer(&mut self, slot_id: u8, endpoint: u8, request_type: u8, request: u8,
                      value: u16, index: u16, length: u16, transfer: TransferDirection)
-                     -> Result<usize, &'static str>
+                     -> Result<usize, Error>
     {
         match &transfer {
             // TODO maybe don't always use DC CIVAC...
@@ -668,13 +692,13 @@ impl<'a> Xhci<'a> {
                 }
             } else {
                 error!("[XHCI] Poll TRB timedout");
-                return Err("USBError::ControlEndpointTimeout");
+                return Err(Error::Str("USBError::ControlEndpointTimeout"));
             }
         }
     }
 
     fn fetch_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
-                        w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
+                        w_index: u16, buf: &mut [u8]) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0x80, REQUEST_GET_DESCRIPTOR,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
@@ -683,7 +707,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn fetch_class_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
-                              w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
+                              w_index: u16, buf: &mut [u8]) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0xA0, REQUEST_GET_DESCRIPTOR,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
@@ -691,8 +715,20 @@ impl<'a> Xhci<'a> {
         )
     }
 
+    fn fetch_hub_descriptor(&mut self, slot_id: u8, device_descriptor: &USBDeviceDescriptor) -> Result<USBHubDescriptor, Error> {
+        let mut hub_descriptor = USBHubDescriptor::default();
+        let desc_type = if device_descriptor.get_max_packet_size() >= 512 { DESCRIPTOR_TYPE_SS_HUB } else { DESCRIPTOR_TYPE_HUB };
+
+        self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_slice(&mut hub_descriptor))[..4])?;
+
+        let length = hub_descriptor.length as usize;
+        self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_slice(&mut hub_descriptor))[..length])?;
+
+        Ok(hub_descriptor)
+    }
+
     fn fetch_hid_report(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
-                        w_index: u16, buf: &mut [u8]) -> Result<usize, &'static str>
+                        w_index: u16, buf: &mut [u8]) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0xA1, REQUEST_GET_REPORT,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
@@ -701,59 +737,65 @@ impl<'a> Xhci<'a> {
     }
 
     fn set_hid_report(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
-                      w_index: u16, value: u8) -> Result<usize, &'static str>
+                      w_index: u16, value: u8) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0x21, REQUEST_SET_REPORT,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
                                   w_index, 1, Some(core::slice::from_ref(&value)), None)
     }
 
-    fn set_hid_idle(&mut self, slot_id: u8) -> Result<usize, &'static str>
+    fn set_hid_idle(&mut self, slot_id: u8) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0x21, REQUEST_SET_IDLE, 0,
                                   0, 0, None, None)
     }
 
-    fn set_hid_protocol(&mut self, slot_id: u8, value: u8) -> Result<usize, &'static str>
+    fn set_hid_protocol(&mut self, slot_id: u8, value: u8) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0x21, REQUEST_SET_PROTOCOL, value as u16,
                                   0, 0, None, None)
     }
 
-    fn set_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, &'static str>
+    fn set_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0x23, REQUEST_SET_FEATURE, feature as u16,
                                   port_id as u16, 0, None, None)
     }
 
-    fn clear_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, &'static str>
+    fn clear_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, Error>
     {
         self.send_control_command(slot_id, 0x23, REQUEST_CLEAR_FEATURE, feature as u16,
                                   port_id as u16, 0, None, None)
     }
 
-    fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, &'static str> {
+    fn reset_tt(&mut self, slot_id: u8, tt_id: u16) -> Result<usize, Error>
+    {
+        self.send_control_command(slot_id, 0x23, REQUEST_RESET_TT, 0,
+                                  tt_id, 0, None, None)
+    }
+
+    fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, Error> {
         let mut status = PortStatus::default();
         self.send_control_command(slot_id, 0xA3, REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(as_slice(&mut status)))?;
         Ok(status)
     }
 
-    fn fetch_device_descriptor(&mut self, slot_id: u8) -> Result<USBDeviceDescriptor, &'static str> {
+    fn fetch_device_descriptor(&mut self, slot_id: u8) -> Result<USBDeviceDescriptor, Error> {
         let mut buf2 = [0u8; 18];
         self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_DEVICE, 0, 0, &mut buf2)?;
         Ok(unsafe { core::mem::transmute(buf2) })
     }
 
-    fn fetch_string_descriptor(&mut self, slot: u8, index: u8, lang: u16) -> Result<String, &'static str> {
+    fn fetch_string_descriptor(&mut self, slot: u8, index: u8, lang: u16) -> Result<String, Error> {
         if index == 0 {
-            return Err("invalid descriptor index 0");
+            return Err(Error::Str("invalid descriptor index 0"));
         }
 
         let mut buf = [0u8; 1];
         self.fetch_descriptor(slot as u8, DESCRIPTOR_TYPE_STRING,
                               index, lang, &mut buf)?;
         if buf[0] == 0 {
-            return Err("USBError::DescriptorNotAvailable");
+            return Err(Error::Str("USBError::DescriptorNotAvailable"));
         }
         let mut buf2: Vec<u8> = Vec::new();
         buf2.resize(buf[0] as usize, 0);
@@ -765,7 +807,7 @@ impl<'a> Xhci<'a> {
         Ok(String::from_utf16_lossy(&buf2[1..]))
     }
 
-    fn fetch_configuration_descriptor(&mut self, slot_id: u8) -> Result<USBConfigurationDescriptorSet, &'static str> {
+    fn fetch_configuration_descriptor(&mut self, slot_id: u8) -> Result<USBConfigurationDescriptorSet, Error> {
         // use pretty_hex::*;
         let mut config_descriptor = [0u8; 9];
         self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_CONFIGURATION, 0, 0, &mut config_descriptor)?;
@@ -833,7 +875,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, &'static str> {
+    fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, Error> {
         self.reset_port(&port)?;
         let slot = self.send_slot_enable()? as usize;
         port.slot_id = slot as u8;
@@ -859,7 +901,7 @@ impl<'a> Xhci<'a> {
 
         assert_ne!(slot, 0, "invalid slot 0 received");
         self.setup_slot(&port, speed, max_packet_size, true);
-        debug!("Slot Setup");
+        debug!("Slot Setup -> max_packet_size: {}", max_packet_size);
         let mut buf = [0u8; 8];
         self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_DEVICE,
                               0, 0, &mut buf)?;
@@ -886,6 +928,9 @@ impl<'a> Xhci<'a> {
 
         let configuration = self.fetch_configuration_descriptor(port.slot_id)?;
         debug!("configuration: {:#?}", configuration);
+
+        self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
+        debug!("Applied Config {}", configuration.config.config_val);
 
         // Display things
         let mfg = self.fetch_string_descriptor(port.slot_id, desc.manufacturer_index, lang).unwrap_or(String::from("(no manufacturer name)"));
@@ -915,6 +960,7 @@ impl<'a> Xhci<'a> {
                         continue;
                     }
 
+
                     // Enable keyboard
                     {
                         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
@@ -930,6 +976,8 @@ impl<'a> Xhci<'a> {
                         let ptr = self.command_ring.as_mut().expect("").push(
                             TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
                         );
+
+                        self.wait_command_complete(ptr).expect("command_complete");
 
                         // self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
                         //                         interface.endpoints[0].address,
@@ -955,33 +1003,41 @@ impl<'a> Xhci<'a> {
                         debug!("done keyboard configure endpoint");
                     }
 
-                    self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
-                    debug!("Applied Config {}", configuration.config.config_val);
+
+                    self.hal.sleep(Duration::from_millis(100));
+
+                    debug!("set hid idle");
+                    self.set_hid_idle(port.slot_id)?;
 
                     // 0 is Boot Protocol
+                    debug!("set hid protocol");
                     self.set_hid_protocol(port.slot_id, 0)?;
 
-                    self.set_hid_idle(port.slot_id)?;
+                    // self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
+                    // debug!("Applied Config {}", configuration.config.config_val);
+
 
                     let index = self.get_epctx_index(interface.endpoints[0].address);
 
                     for i in 0..20 {
-                        match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
-                            Ok(_) => {
-                                info!("set_hid success");
-                            }
-                            Err(e) => {
-                                warn!("set_hid: failed to read: {}", e);
-                            }
-                        }
+                        // debug!("set hid report");
+                        // match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
+                        //     Ok(_) => {
+                        //         info!("set_hid success");
+                        //     }
+                        //     Err(e) => {
+                        //         warn!("set_hid: failed to read: {:?}", e);
+                        //     }
+                        // }
 
+                        debug!("fetch hid report");
                         let mut buf = Box::new([0u8; 128]);
                         match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, &mut buf[0..8]) {
                             Ok(_) => {
                                 info!("got response: {:?}", &buf[0..8]);
                             }
                             Err(e) => {
-                                warn!("failed to read: {}", e);
+                                warn!("failed to read: {:?}", e);
                             }
                         }
 
@@ -1006,14 +1062,7 @@ impl<'a> Xhci<'a> {
                         continue;
                     }
 
-                    let mut hub_descriptor = USBHubDescriptor::default();
-                    let mut descriptor_length: usize = 0;
-                    if desc.get_max_packet_size() >= 512 {
-                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-                    } else {
-                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-                    }
-                    descriptor_length = hub_descriptor.length as usize;
+                    let hub_descriptor= self.fetch_hub_descriptor(port.slot_id, &desc)?;
                     info!("Hub Descriptor: {:?}", hub_descriptor);
 
                     // // Get Status
@@ -1089,12 +1138,7 @@ impl<'a> Xhci<'a> {
                     self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
                     debug!("Applied Config {}", configuration.config.config_val);
 
-                    let mut hub_descriptor = USBHubDescriptor::default();
-                    if desc.get_max_packet_size() >= 512 {
-                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_SS_HUB, 0, 0, as_slice(&mut hub_descriptor))?;
-                    } else {
-                        self.fetch_class_descriptor(port.slot_id, DESCRIPTOR_TYPE_HUB, 0, 0, &mut as_slice(&mut hub_descriptor)[..descriptor_length])?;
-                    }
+                    let hub_descriptor = self.fetch_hub_descriptor(port.slot_id, &desc)?;
                     info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
 
 
@@ -1117,7 +1161,7 @@ impl<'a> Xhci<'a> {
                         match self.setup_new_device(&mut child_port) {
                             Ok(_) => {}
                             Err(e) => {
-                                error!("Failed to configure child of port {}: {}", port.port_id, e);
+                                error!("Failed to configure child of port {}: {:?}", port.port_id, e);
                             }
                         }
                     }
@@ -1174,7 +1218,7 @@ impl<'a> Xhci<'a> {
         return Ok(slot as u8);
     }
 
-    pub fn do_stuff(&mut self) -> Result<(), &'static str> {
+    pub fn do_stuff(&mut self) -> Result<(), Error> {
         self.transfer_ownership()?;
 
         self.reset()?;
@@ -1189,7 +1233,7 @@ impl<'a> Xhci<'a> {
             debug!("[XHCI] PageSize = {}", self.info.page_size);
             if self.info.page_size > 4096 {
                 error!("[XHCI] PageSize > 4096 not supported");
-                return Err("PageSize > 4096 not supported");
+                return Err(Error::Str("PageSize > 4096 not supported"));
             }
             self.info.big_context = self.cap.hcc_param1.read() & CAP_HCCPARAMS1_CSZ_MASK != 0;
             debug!("[XHCI] controller use {} bytes context", if self.info.big_context { 64 } else { 32 });
@@ -1233,7 +1277,7 @@ impl<'a> Xhci<'a> {
         Ok(())
     }
 
-    fn initialize_memory_structures(&mut self) -> Result<(), &'static str> {
+    fn initialize_memory_structures(&mut self) -> Result<(), Error> {
         // Step 1: Setup Device Context Base Address Array
         if self.device_context_baa.is_none() {
             self.device_context_baa = Some(Box::new(DeviceContextBaseAddressArray::default()));
@@ -1259,7 +1303,7 @@ impl<'a> Xhci<'a> {
         debug!("[XHCI] CRCR initial {:x}", initial_crcr);
         {
             if initial_crcr & OP_CRCR_CRR_MASK != 0 {
-                return Err("CrCr is Running");
+                return Err(Error::Str("CrCr is Running"));
             }
 
             let cyc_state = self.command_ring.as_ref().unwrap().cycle_state as u64;
@@ -1333,7 +1377,7 @@ impl<'a> Xhci<'a> {
         Ok(())
     }
 
-    fn start(&mut self) -> Result<(), &'static str> {
+    fn start(&mut self) -> Result<(), Error> {
         debug!("[XHCI] Starting the controller");
 
         self.op.command.update(|reg| {
@@ -1342,7 +1386,7 @@ impl<'a> Xhci<'a> {
             *reg &= !OP_CMD_INT_EN_MASK; // DISABLE INTERRUPT
         });
 
-        self.wait_until("did not start!", HALT_TIMEOUT, |this| {
+        self.wait_until(Error::Str("did not start!"), HALT_TIMEOUT, |this| {
             this.op.status.read() & OP_STS_HLT_MASK == 0
         })?;
 
@@ -1383,13 +1427,17 @@ impl<'a> Xhci<'a> {
                     if c.trb_pointer == ptr {
                         debug!("Got command completion: {:?}", c);
                         if c.code != 1 {
-                            panic!("EHHHH WTF")
+                            panic!("EHHHH WTF: {:?}", TRBCompletionCode::from(c.code));
                         }
                         return Some(c);
                     } else {
                         debug!("trb_pointer badddddd: {:?}", c);
-                    }
-                }
+
+                        let my_trb = TRBType::from(unsafe { &*(c.trb_pointer as *const TRB) }.clone());
+
+                        debug!("-> {:?}", my_trb);
+
+                    } }
                 e => {
                     debug!("Lol: {:?}", e);
                 }
@@ -1438,7 +1486,7 @@ impl<'a> Xhci<'a> {
         if ready {
             let mut port = Port::new_from_root(port_id);
             if let Err(e) = self.setup_new_device(&mut port) {
-                error!("setup_new_device() err: {}", e);
+                error!("setup_new_device() err: {:?}", e);
             }
         }
     }
@@ -1460,7 +1508,7 @@ impl<'a> Xhci<'a> {
     }
 
     /// This function transfer the ownership of the controller from BIOS
-    pub fn transfer_ownership(&mut self) -> Result<(), &'static str> {
+    pub fn transfer_ownership(&mut self) -> Result<(), Error> {
         let tags = self.extended_capability().find(|t| {
             match t {
                 ExtendedCapabilityTag::USBLegacySupport { head: _, bios_own: _, os_own: _ } => true,
@@ -1471,7 +1519,7 @@ impl<'a> Xhci<'a> {
             Some(t) => {
                 if let ExtendedCapabilityTag::USBLegacySupport { head, bios_own, os_own } = t {
                     if os_own && bios_own {
-                        return Err("XHCIError::UnexpectedOwnership");
+                        return Err(Error::Str("XHCIError::UnexpectedOwnership"));
                     }
                     if os_own {
                         return Ok(());
@@ -1604,7 +1652,7 @@ pub fn init_dwc3(base_address: u64) {
 pub fn do_stuff(base_address: u64, hal: &dyn HAL) {
     match Xhci::new(base_address, hal).do_stuff() {
         Ok(()) => info!("did stuff successfully"),
-        Err(e) => error!("Error failed to do stuff: {}", e),
+        Err(e) => error!("Error failed to do stuff: {:?}", e),
     }
 }
 
