@@ -502,26 +502,24 @@ impl<'a> Xhci<'a> {
 
             trbs.push(TRB { data });
         }
-        // Event Data TRB
-        // let mut event_data = EventDataTRB::default();
-        // event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
-        // {
-        //     let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-        //     lock.push(TRB { event_data });
-        // }
 
         // Status TRB
         let mut status_stage = StatusStageTRB::default();
         status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
         status_stage.meta.set_ioc(true);
-        status_stage.meta.set_eval_next(true);
-        status_stage.meta.set_chain(true);
+        // status_stage.meta.set_eval_next(true);
+        // status_stage.meta.set_chain(true);
         if !(min_length > 0 && read_from_usb.is_some()) {
             // status stage read is the reverse of the data stage read.
             // See Table 4-7 in the Intel xHCI manual
             status_stage.meta.set_read(true);
         }
         trbs.push(TRB { status_stage });
+
+        // Event Data TRB
+        // let mut event_data = EventDataTRB::default();
+        // event_data.meta.set_trb_type(TRB_TYPE_EVENT_DATA as u8);
+        // trbs.push(TRB { event_data });
 
         {
             let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
