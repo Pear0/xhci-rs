@@ -514,6 +514,8 @@ impl<'a> Xhci<'a> {
         let mut status_stage = StatusStageTRB::default();
         status_stage.meta.set_trb_type(TRB_TYPE_STATUS as u8);
         status_stage.meta.set_ioc(true);
+        status_stage.meta.set_eval_next(true);
+        status_stage.meta.set_chain(true);
         if !(min_length > 0 && read_from_usb.is_some()) {
             // status stage read is the reverse of the data stage read.
             // See Table 4-7 in the Intel xHCI manual
@@ -908,10 +910,19 @@ impl<'a> Xhci<'a> {
 
         debug!("First descriptor: {:?}", &buf);
 
+        // TODO: Potentially Incorrect Quirk
         if !self.quirks.no_reset_before_address_device {
             self.reset_port(&port)?;
         }
 
+        let max_packet_size = match buf[7] {
+            8 => 8,
+            16 => 16,
+            32 => 32,
+            64 => 64,
+            9 => 512,
+            _ => panic!("Invalid maxPacketSize = {}", buf[7])
+        };
         self.setup_slot(&port, speed, max_packet_size, false);
         let desc = self.fetch_device_descriptor(port.slot_id)?;
         debug!("Device Descriptor: {:#?}", desc);
