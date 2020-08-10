@@ -38,6 +38,7 @@ use crate::quirks::XHCIQuirks;
 mod macros;
 
 pub mod quirks;
+#[macro_use]
 pub(crate) mod consts;
 pub(crate) mod descriptor;
 pub(crate) mod extended_capability;
@@ -446,7 +447,7 @@ impl<'a> Xhci<'a> {
         input_ctx
     }
 
-    fn send_control_command(&mut self, slot_id: u8, request_type: u8, request: u8,
+    fn send_control_command(&mut self, slot_id: u8, request_type: TypeTriple, request: u8,
                             value: u16, index: u16, length: u16,
                             write_to_usb: Option<&[u8]>, read_from_usb: Option<&mut [u8]>)
                             -> Result<usize, Error>
@@ -474,7 +475,7 @@ impl<'a> Xhci<'a> {
             return Err("USBError::InvalidArgument".into());
         };
         let mut setup = SetupStageTRB {
-            request_type,
+            request_type: request_type.into(),
             request,
             value,
             index,
@@ -710,7 +711,8 @@ impl<'a> Xhci<'a> {
     fn fetch_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
                         w_index: u16, buf: &mut [u8]) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0x80, REQUEST_GET_DESCRIPTOR,
+        assert_eq!(Into::<u8>::into(request_type!(DeviceToHost, Standard, Device)), 0x80u8);
+        self.send_control_command(slot_id, request_type!(DeviceToHost, Standard, Device), REQUEST_GET_DESCRIPTOR,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
                                   w_index, buf.len() as u16, None, Some(buf),
         )
@@ -719,7 +721,8 @@ impl<'a> Xhci<'a> {
     fn fetch_class_descriptor(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
                               w_index: u16, buf: &mut [u8]) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0xA0, REQUEST_GET_DESCRIPTOR,
+        assert_eq!(Into::<u8>::into(request_type!(DeviceToHost, Class, Device)), 0xA0u8);
+        self.send_control_command(slot_id, request_type!(DeviceToHost, Class, Device), REQUEST_GET_DESCRIPTOR,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
                                   w_index, buf.len() as u16, None, Some(buf),
         )
@@ -740,7 +743,8 @@ impl<'a> Xhci<'a> {
     fn fetch_hid_report(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
                         w_index: u16, buf: &mut [u8]) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0xA1, REQUEST_GET_REPORT,
+        assert_eq!(Into::<u8>::into(request_type!(DeviceToHost, Class, Interface)), 0xA1u8);
+        self.send_control_command(slot_id, request_type!(DeviceToHost, Class, Interface), REQUEST_GET_REPORT,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
                                   w_index, buf.len() as u16, None, Some(buf),
         )
@@ -749,44 +753,51 @@ impl<'a> Xhci<'a> {
     fn set_hid_report(&mut self, slot_id: u8, desc_type: u8, desc_index: u8,
                       w_index: u16, value: u8) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0x21, REQUEST_SET_REPORT,
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Interface)), 0x21u8);
+        self.send_control_command(slot_id, request_type!(HostToDevice, Class, Interface), REQUEST_SET_REPORT,
                                   ((desc_type as u16) << 8) | (desc_index as u16),
                                   w_index, 1, Some(core::slice::from_ref(&value)), None)
     }
 
     fn set_hid_idle(&mut self, slot_id: u8) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0x21, REQUEST_SET_IDLE, 0,
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Interface)), 0x21u8);
+        self.send_control_command(slot_id, request_type!(HostToDevice, Class, Interface), REQUEST_SET_IDLE, 0,
                                   0, 0, None, None)
     }
 
     fn set_hid_protocol(&mut self, slot_id: u8, value: u8) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0x21, REQUEST_SET_PROTOCOL, value as u16,
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Interface)), 0x21u8);
+        self.send_control_command(slot_id, request_type!(HostToDevice, Class, Interface), REQUEST_SET_PROTOCOL, value as u16,
                                   0, 0, None, None)
     }
 
     fn set_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0x23, REQUEST_SET_FEATURE, feature as u16,
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Other)), 0x23u8);
+        self.send_control_command(slot_id, request_type!(HostToDevice, Class, Other), REQUEST_SET_FEATURE, feature as u16,
                                   port_id as u16, 0, None, None)
     }
 
     fn clear_feature(&mut self, slot_id: u8, port_id: u8, feature: u8) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0x23, REQUEST_CLEAR_FEATURE, feature as u16,
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Other)), 0x23u8);
+        self.send_control_command(slot_id, request_type!(HostToDevice, Class, Other), REQUEST_CLEAR_FEATURE, feature as u16,
                                   port_id as u16, 0, None, None)
     }
 
     fn reset_tt(&mut self, slot_id: u8, tt_id: u16) -> Result<usize, Error>
     {
-        self.send_control_command(slot_id, 0x23, REQUEST_RESET_TT, 0,
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Other)), 0x23u8);
+        self.send_control_command(slot_id, request_type!(HostToDevice, Class, Other), REQUEST_RESET_TT, 0,
                                   tt_id, 0, None, None)
     }
 
     fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, Error> {
         let mut status = PortStatus::default();
-        self.send_control_command(slot_id, 0xA3, REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(as_slice(&mut status)))?;
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Other)), 0xA3u8);
+        self.send_control_command(slot_id, request_type!(DeviceToHost, Class, Other), REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(as_slice(&mut status)))?;
         Ok(status)
     }
 
@@ -933,7 +944,8 @@ impl<'a> Xhci<'a> {
         let configuration = self.fetch_configuration_descriptor(port.slot_id)?;
         debug!("configuration: {:#?}", configuration);
 
-        self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
+        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Standard, Device)), 0x00u8);
+        self.send_control_command(port.slot_id, request_type!(HostToDevice, Standard, Device), REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
         debug!("Applied Config {}", configuration.config.config_val);
         self.hal.sleep(Duration::from_millis(10));
 

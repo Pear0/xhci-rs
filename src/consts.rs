@@ -264,3 +264,44 @@ pub const FEATURE_C_PORT_RESET: u8 = 0x14;
 pub const FEATURE_PORT_TEST: u8 = 0x15;
 pub const FEATURE_PORT_INDICATOR: u8 = 0x16;
 
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
+pub enum TransferDirection {
+    HostToDevice = 0,
+    DeviceToHost,
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
+pub enum RequestType {
+    Standard = 0,
+    Class,
+    Vendor,
+    Reserved,
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
+pub enum Recipient {
+    Device = 0,
+    Interface,
+    Endpoint,
+    Other,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct TypeTriple(pub TransferDirection, pub RequestType, pub Recipient);
+
+impl Into<u8> for TypeTriple {
+    fn into(self) -> u8 {
+        ((self.0 as u8) << 7) | ((self.1 as u8) << 5) | ((self.2 as u8) << 0)
+    }
+}
+
+#[macro_export]
+macro_rules! request_type {
+    ($dir:ident, $typ:ident, $rec:ident) => {{
+        $crate::consts::TypeTriple($crate::consts::TransferDirection::$dir, $crate::consts::RequestType::$typ, $crate::consts::Recipient::$rec)
+    }};
+}
