@@ -916,11 +916,6 @@ impl<'a> Xhci<'a> {
 
         debug!("First descriptor: {:?}", &buf);
 
-        // TODO: Potentially Incorrect Quirk
-        if !self.quirks.no_reset_before_address_device {
-            self.reset_port(&port)?;
-        }
-
         let max_packet_size = match buf[7] {
             8 => 8,
             16 => 16,
@@ -940,20 +935,22 @@ impl<'a> Xhci<'a> {
         debug!("Applied Config {}", configuration.config.config_val);
         self.hal.sleep(Duration::from_millis(10));
 
-        let mut buf = [0u8; 2];
-        self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
-                              0, 0, &mut buf)?;
-        assert_eq!(buf[1], DESCRIPTOR_TYPE_STRING, "Descriptor is not STRING");
-        assert!(buf[0] >= 4, "has language");
-        let mut buf2: Vec<u8> = Vec::new();
-        buf2.resize(buf[0] as usize, 0);
-        self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
-                              0, 0, &mut buf2)?;
-        let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
+        // Fetching language is removed due to various issues and most OS doesn't do it.
+        // let mut buf = [0u8; 2];
+        // self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
+        //                       0, 0, &mut buf)?;
+        // assert_eq!(buf[1], DESCRIPTOR_TYPE_STRING, "Descriptor is not STRING");
+        // assert!(buf[0] >= 4, "has language");
+        // let mut buf2: Vec<u8> = Vec::new();
+        // buf2.resize(buf[0] as usize, 0);
+        // self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
+        //                       0, 0, &mut buf2)?;
+        // let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
+
         // Display things
-        let mfg = self.fetch_string_descriptor(port.slot_id, desc.manufacturer_index, lang).unwrap_or(String::from("(no manufacturer name)"));
-        let prd = self.fetch_string_descriptor(port.slot_id, desc.product_index, lang).unwrap_or(String::from("(no product name)"));
-        let serial = self.fetch_string_descriptor(port.slot_id, desc.serial_index, lang).unwrap_or(String::from("(no serial number)"));
+        let mfg = self.fetch_string_descriptor(port.slot_id, desc.manufacturer_index, 0).unwrap_or(String::from("(no manufacturer name)"));
+        let prd = self.fetch_string_descriptor(port.slot_id, desc.product_index, 0).unwrap_or(String::from("(no product name)"));
+        let serial = self.fetch_string_descriptor(port.slot_id, desc.serial_index, 0).unwrap_or(String::from("(no serial number)"));
         debug!("[XHCI] New device:\n  MFG: {}\n  Prd:{}\n  Serial:{}", mfg, prd, serial);
 
         for interface in configuration.ifsets {
