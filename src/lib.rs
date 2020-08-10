@@ -120,8 +120,11 @@ fn as_slice<T>(t: &mut T) -> &mut [u8] {
 
 #[derive(Copy, Clone, Debug)]
 pub enum FlushType {
+    /// Flush dirty cache lines to RAM (does not drop cache lines)
     Clean,
+    /// Drop (potentially dirty) cache lines without writing back to RAM
     Invalidate,
+    /// Clean then Drop
     CleanAndInvalidate,
 }
 
@@ -399,14 +402,12 @@ impl<'a> Xhci<'a> {
 
     fn setup_slot(&mut self, port: &Port, speed: u8, max_packet_size: u16, block_cmd: bool) -> Box<InputContext> {
         debug!("setup_slot(port_id: {}, speed: {}, max_packet_size: {}, block_cmd: {})", port.port_id, speed, max_packet_size, block_cmd);
-        // TODO Cleanup we should not destroy dca because it gets called again;
         let slot = port.slot_id as usize;
 
         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
-        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
         if let Some(output_ctx) = self.device_contexts[port.slot_id as usize].as_ref() {
-            self.flush_struct::<DeviceContextArray>(output_ctx.as_ref(), FlushType::Invalidate); // TODO: Will: Check flush type
+            self.flush_struct::<DeviceContextArray>(output_ctx.as_ref(), FlushType::Invalidate);
             // Clone slot context from Output -> Input
             *input_ctx.get_slot_mut() = output_ctx.get_slot().clone();
 
@@ -417,7 +418,6 @@ impl<'a> Xhci<'a> {
             let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
 
             self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref(), FlushType::Clean);
-            self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
 
             // Activate Entry
             self.device_contexts[slot - 1] = Some(dev_ctx);
@@ -426,7 +426,6 @@ impl<'a> Xhci<'a> {
             self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap(), FlushType::Clean);
         }
 
-        //TODO: Will: cache flush?
         self.create_slot_context(&mut input_ctx, port, speed, max_packet_size);
         self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
                                 0, EP_TYPE_CONTROL_BIDIR, max_packet_size,
@@ -434,6 +433,9 @@ impl<'a> Xhci<'a> {
 
         input_ctx.get_input_mut()[1] = 0b11;
 
+        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+
+        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
         let ptr = self.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::address_device(slot as u8, input_ctx_ptr, block_cmd) }
         );
