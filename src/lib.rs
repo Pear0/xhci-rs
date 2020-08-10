@@ -29,7 +29,7 @@ use crate::descriptor::{USBConfigurationDescriptor, USBConfigurationDescriptorSe
 use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::items::{Port, TransferDirection};
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
-use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, XHCIRing, XHCIRingSegment};
+use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, XHCIRing, XHCIRingSegment, SlotContext};
 use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TRB, TRBType};
 use crate::trb::TRBType::TransferEvent;
 use crate::quirks::XHCIQuirks;
@@ -382,12 +382,12 @@ impl<'a> Xhci<'a> {
         self.transfer_rings.insert((slot_id, index), Arc::new(Mutex::new(transfer_ring)));
     }
 
-    fn create_slot_contexts(&mut self, port: &Port, speed: u8, max_packet_size: u16) -> Box<InputContext> {
-        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+    fn create_slot_context(&mut self, input_ctx: &mut InputContext, port: &Port, speed: u8, max_packet_size: u16) {
         input_ctx.get_slot_mut().dword1.set_speed(speed);
         input_ctx.get_slot_mut().dword1.set_context_entries(1); // TODO Maybe not hardcode 1?
         input_ctx.get_slot_mut().root_hub_port_number = port.get_root_port_id();
         input_ctx.get_slot_mut().dword1.set_route_string(port.construct_route_string());
+        input_ctx.get_slot_mut().slot_state = 0;
 
         if let Some(parent) = port.parent.as_ref() {
             if port.is_low_or_full_speed && !parent.is_low_or_full_speed {
@@ -395,14 +395,6 @@ impl<'a> Xhci<'a> {
                 input_ctx.get_slot_mut().parent_port_number = port.port_id;
             }
         }
-
-        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
-                                0, EP_TYPE_CONTROL_BIDIR, max_packet_size,
-                                0, 0);
-
-        input_ctx.get_input_mut()[1] = 0b11;
-
-        input_ctx
     }
 
     fn setup_slot(&mut self, port: &Port, speed: u8, max_packet_size: u16, block_cmd: bool) -> Box<InputContext> {
@@ -410,20 +402,37 @@ impl<'a> Xhci<'a> {
         // TODO Cleanup we should not destroy dca because it gets called again;
         let slot = port.slot_id as usize;
 
-        let mut input_ctx = self.create_slot_contexts(port, speed, max_packet_size);
-
-        let mut dev_ctx = Box::new(if self.info.big_context { DeviceContextArray::new_big() } else { DeviceContextArray::new_normal() });
-        let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
+        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
-        self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref(), FlushType::Clean);
-        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+        if let Some(output_ctx) = self.device_contexts[port.slot_id as usize].as_ref() {
+            self.flush_struct::<DeviceContextArray>(output_ctx.as_ref(), FlushType::Invalidate); // TODO: Will: Check flush type
+            // Clone slot context from Output -> Input
+            *input_ctx.get_slot_mut() = output_ctx.get_slot().clone();
 
-        // Activate Entry
-        self.device_contexts[slot - 1] = Some(dev_ctx);
-        self.device_context_baa.as_mut().expect("").entries[slot] = ctx_ptr;
+            // Clone CtrlEP0
+            *input_ctx.get_endpoint_mut(0) = output_ctx.get_endpoint(0).clone();
+        } else {
+            let mut dev_ctx = Box::new(if self.info.big_context { DeviceContextArray::new_big() } else { DeviceContextArray::new_normal() });
+            let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
 
-        self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap(), FlushType::Clean);
+            self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref(), FlushType::Clean);
+            self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+
+            // Activate Entry
+            self.device_contexts[slot - 1] = Some(dev_ctx);
+            self.device_context_baa.as_mut().expect("").entries[slot] = ctx_ptr;
+
+            self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap(), FlushType::Clean);
+        }
+
+        //TODO: Will: cache flush?
+        self.create_slot_context(&mut input_ctx, port, speed, max_packet_size);
+        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
+                                0, EP_TYPE_CONTROL_BIDIR, max_packet_size,
+                                0, 0);
+
+        input_ctx.get_input_mut()[1] = 0b11;
 
         let ptr = self.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::address_device(slot as u8, input_ctx_ptr, block_cmd) }
@@ -538,7 +547,6 @@ impl<'a> Xhci<'a> {
                         debug!("Transfer Complete: status = {:?}", code);
                         if t.status.get_code() != TRBCompletionCode::ShortPacket as u8 {
                             if !matches!(code, TRBCompletionCode::Success) {
-
                                 {
                                     let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
                                     lock.push_group(trbs.as_slice());
@@ -930,6 +938,7 @@ impl<'a> Xhci<'a> {
 
         self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
         debug!("Applied Config {}", configuration.config.config_val);
+        self.hal.sleep(Duration::from_millis(10));
 
         let mut buf = [0u8; 2];
         self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
@@ -1071,7 +1080,7 @@ impl<'a> Xhci<'a> {
                         continue;
                     }
 
-                    let hub_descriptor= self.fetch_hub_descriptor(port.slot_id, &desc)?;
+                    let hub_descriptor = self.fetch_hub_descriptor(port.slot_id, &desc)?;
                     info!("Hub Descriptor: {:?}", hub_descriptor);
 
                     // // Get Status
@@ -1143,9 +1152,6 @@ impl<'a> Xhci<'a> {
                     }
 
                     debug!("slot state = {}", self.device_contexts[port.slot_id as usize - 1].as_ref().unwrap().get_slot().slot_state);
-
-                    self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
-                    debug!("Applied Config {}", configuration.config.config_val);
 
                     let hub_descriptor = self.fetch_hub_descriptor(port.slot_id, &desc)?;
                     info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
@@ -1441,12 +1447,8 @@ impl<'a> Xhci<'a> {
                         return Some(c);
                     } else {
                         debug!("trb_pointer badddddd: {:?}", c);
-
-                        let my_trb = TRBType::from(unsafe { &*(c.trb_pointer as *const TRB) }.clone());
-
-                        debug!("-> {:?}", my_trb);
-
-                    } }
+                    }
+                }
                 e => {
                     debug!("Lol: {:?}", e);
                 }
