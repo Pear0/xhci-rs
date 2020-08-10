@@ -924,6 +924,13 @@ impl<'a> Xhci<'a> {
         self.setup_slot(&port, speed, max_packet_size, false);
         let desc = self.fetch_device_descriptor(port.slot_id)?;
         debug!("Device Descriptor: {:#?}", desc);
+
+        let configuration = self.fetch_configuration_descriptor(port.slot_id)?;
+        debug!("configuration: {:#?}", configuration);
+
+        self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
+        debug!("Applied Config {}", configuration.config.config_val);
+
         let mut buf = [0u8; 2];
         self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
                               0, 0, &mut buf)?;
@@ -934,13 +941,6 @@ impl<'a> Xhci<'a> {
         self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
                               0, 0, &mut buf2)?;
         let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
-
-        let configuration = self.fetch_configuration_descriptor(port.slot_id)?;
-        debug!("configuration: {:#?}", configuration);
-
-        self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
-        debug!("Applied Config {}", configuration.config.config_val);
-
         // Display things
         let mfg = self.fetch_string_descriptor(port.slot_id, desc.manufacturer_index, lang).unwrap_or(String::from("(no manufacturer name)"));
         let prd = self.fetch_string_descriptor(port.slot_id, desc.product_index, lang).unwrap_or(String::from("(no product name)"));
@@ -1028,7 +1028,7 @@ impl<'a> Xhci<'a> {
 
                     let index = self.get_epctx_index(interface.endpoints[0].address);
 
-                    for i in 0..20 {
+                    for i in 0..10 {
                         // debug!("set hid report");
                         // match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
                         //     Ok(_) => {
