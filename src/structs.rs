@@ -338,14 +338,14 @@ impl DeviceContextArray {
         }
     }
 
-    pub fn get_ptr_va(&mut self) -> u64 {
+    pub fn get_ptr_va(&self) -> u64 {
         match self {
             DeviceContextArray::Normal(c) => c as *const DeviceContextArrayTempl<[u8; 0]> as u64,
             DeviceContextArray::Big(c) => c as *const DeviceContextArrayTempl<[u8; 32]> as u64,
         }
     }
 
-    pub fn get_size(&mut self) -> usize {
+    pub fn get_size(&self) -> usize {
         match self {
             DeviceContextArray::Normal(c) => core::mem::size_of_val(c),
             DeviceContextArray::Big(c) => core::mem::size_of_val(c),

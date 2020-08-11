@@ -246,6 +246,7 @@ pub const DESCRIPTOR_TYPE_SS_HUB: u8 = 0x2A;
 
 /* ---------- Class Codes ----------- */
 pub const CLASS_CODE_HID: u8 = 3;
+pub const CLASS_CODE_MASS: u8 = 8;
 pub const CLASS_CODE_HUB: u8 = 9;
 
 /* ---------- Feature Selector --------- */

@@ -7,6 +7,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+// TODO: https://docs.rs/downcast-rs/1.2.0/downcast_rs/index.html for USB implementation specifics
+
 extern crate alloc;
 #[macro_use]
 extern crate log;
@@ -382,6 +384,10 @@ impl<'a> Xhci<'a> {
         epctx.average_trb_len = if endpoint_type == EP_TYPE_CONTROL_BIDIR { 8 } else { esit_payload_size as u16 };
         epctx.max_esit_payload_lo = esit_payload_size as u16;
         epctx.dequeu_pointer = transfer_ring_ptr | (transfer_ring.cycle_state & 0x1) as u64; // Cycle Bit
+
+        // update input context adds/removes
+        input_ctx.get_input_mut()[1] |= 1;
+        input_ctx.get_input_mut()[1] |= 0b1 << (index + 1);
 
         self.transfer_rings.insert((slot_id, index), Arc::new(Mutex::new(transfer_ring)));
     }
@@ -796,7 +802,7 @@ impl<'a> Xhci<'a> {
 
     fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, Error> {
         let mut status = PortStatus::default();
-        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Class, Other)), 0xA3u8);
+        assert_eq!(Into::<u8>::into(request_type!(DeviceToHost, Class, Other)), 0xA3u8);
         self.send_control_command(slot_id, request_type!(DeviceToHost, Class, Other), REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(as_slice(&mut status)))?;
         Ok(status)
     }
@@ -896,6 +902,33 @@ impl<'a> Xhci<'a> {
         }
     }
 
+    fn with_input_context<F: FnOnce(&mut Self, &mut InputContext) -> Result<(), Error>>(&mut self, port: &Port, func: F) -> Result<(), Error> {
+        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+
+        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
+        self.hal.flush_cache(ctx.get_ptr_va(), ctx.get_size() as u64, FlushType::Invalidate);
+
+        *input_ctx.get_slot_mut() = ctx.get_slot().clone();
+        // 31 is not a typo
+        for i in 0..31 {
+            *input_ctx.get_endpoint_mut(i) = ctx.get_endpoint(i).clone();
+        }
+
+        func(self, input_ctx.as_mut())?;
+
+        // always update slot context
+        input_ctx.get_input_mut()[1] |= 1;
+
+        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+
+        let ptr = self.command_ring.as_mut().expect("").push(
+            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
+        );
+        self.wait_command_complete(ptr).ok_or(Error::Str("command did not complete"))?;
+        Ok(())
+    }
+
     fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, Error> {
         self.reset_port(&port)?;
         let slot = self.send_slot_enable()? as usize;
@@ -969,12 +1002,44 @@ impl<'a> Xhci<'a> {
         let serial = self.fetch_string_descriptor(port.slot_id, desc.serial_index, 0x409).unwrap_or(String::from("(no serial number)"));
         debug!("[XHCI] New device:\n  MFG: {}\n  Prd:{}\n  Serial:{}", mfg, prd, serial);
 
-        for interface in configuration.ifsets {
+        for interface in &configuration.ifsets {
             if interface.interface.alt_set != 0 {
                 debug!("Skipping non-default altSetting Interface");
                 continue;
             }
             match interface.interface.class {
+                CLASS_CODE_MASS => {
+                    if interface.interface.sub_class != 0x6 {
+                        debug!("Skipping MSD with sub-class other than 0x6 (Transparent SCSI)");
+                        continue;
+                    }
+
+                    if interface.interface.protocol != 0x50 {
+                        debug!("Skipping MSD with protocol other than bulk-only");
+                        continue;
+                    }
+
+                    if interface.endpoints.len() < 2 {
+                        warn!("MSD has not enough endpoints!");
+                        continue;
+                    }
+
+                    self.with_input_context(port, |this, input_ctx| {
+
+                        this.configure_endpoint(port.slot_id, input_ctx,
+                                                interface.endpoints[0].address,
+                                                EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
+                                                interface.endpoints[0].interval, this.get_max_esti_payload(&interface.endpoints[0]));
+
+
+                        input_ctx.set_configure_ep_meta(configuration.config.config_val,
+                                                        interface.interface.interface_number, interface.interface.alt_set);
+
+                        Ok(())
+                    })?;
+
+
+                }
                 CLASS_CODE_HID => {
                     if interface.interface.sub_class != 1 {
                         debug!("Skipping non bios-mode HID device");
@@ -993,47 +1058,22 @@ impl<'a> Xhci<'a> {
 
 
                     // Enable keyboard
-                    {
-                        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
 
-                        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
-                        let mut slot_ctx = input_ctx.get_slot_mut();
-                        *slot_ctx = ctx.get_slot().clone();
-
-                        input_ctx.get_input_mut()[1] = 1;
-
-                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
-                        let ptr = self.command_ring.as_mut().expect("").push(
-                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
-                        );
-
-                        self.wait_command_complete(ptr).expect("command_complete");
+                    self.with_input_context(port, |_this, input_ctx| {
 
                         // self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
                         //                         interface.endpoints[0].address,
                         //                         EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
                         //                         interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
 
+
                         input_ctx.set_configure_ep_meta(configuration.config.config_val,
                                                         interface.interface.interface_number, interface.interface.alt_set);
 
-                        // index 1 == add things bitfield.
-                        input_ctx.get_input_mut()[1] = 1; // | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
+                        Ok(())
+                    })?;
 
-                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
-
-                        debug!("sending keyboard configure endpoint");
-
-                        let ptr = self.command_ring.as_mut().expect("").push(
-                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
-                        );
-                        self.wait_command_complete(ptr).expect("command_complete");
-
-                        debug!("done keyboard configure endpoint");
-                    }
-
+                    debug!("done keyboard configure endpoint");
 
                     self.hal.sleep(Duration::from_millis(100));
 
@@ -1112,56 +1152,31 @@ impl<'a> Xhci<'a> {
 
                     // Reconfigure to hub
                     {
-                        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+                        self.with_input_context(port, |_this, input_ctx| {
 
-                        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
-                        let mut slot_ctx = input_ctx.get_slot_mut();
-                        *slot_ctx = ctx.get_slot().clone();
-                        slot_ctx.dword1.set_hub(true);
-                        slot_ctx.numbr_ports = hub_descriptor.num_ports;
-                        slot_ctx.slot_state = 0;
+                            let mut slot_ctx = input_ctx.get_slot_mut();
+                            slot_ctx.dword1.set_hub(true);
+                            slot_ctx.numbr_ports = hub_descriptor.num_ports;
+                            slot_ctx.slot_state = 0;
 
-                        slot_ctx.interrupter_ttt = 0;
+                            slot_ctx.interrupter_ttt = 0;
 
-                        input_ctx.get_input_mut()[1] = 0b1;
+                            Ok(())
+                        })?;
 
-                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
-                        let ptr = self.command_ring.as_mut().expect("").push(
-                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
-                        );
+                        self.with_input_context(port, |this, input_ctx| {
 
-                        self.wait_command_complete(ptr).expect("command_complete");
-                        debug!("Slot Update");
+                            this.configure_endpoint(port.slot_id, input_ctx,
+                                                    interface.endpoints[0].address,
+                                                    EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
+                                                    interface.endpoints[0].interval, this.get_max_esti_payload(&interface.endpoints[0]));
 
-                        // Config Endpoint
-                        let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
-                        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
-                        let mut slot_ctx = input_ctx.get_slot_mut();
-                        *slot_ctx = ctx.get_slot().clone();
+                            input_ctx.set_configure_ep_meta(configuration.config.config_val,
+                                                            interface.interface.interface_number, interface.interface.alt_set);
 
-                        input_ctx.get_input_mut()[1] = 0b1001;
-                        // Clone CTRL EP
-                        *input_ctx.get_endpoint_mut(0) = ctx.get_endpoint(0).clone();
+                            Ok(())
+                        })?;
 
-                        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
-                                                interface.endpoints[0].address,
-                                                EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
-                                                interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
-
-                        input_ctx.set_configure_ep_meta(configuration.config.config_val,
-                                                        interface.interface.interface_number, interface.interface.alt_set);
-
-                        // index 1 == add things bitfield.
-                        input_ctx.get_input_mut()[1] = 1 | (0b1 << (self.get_epctx_index(interface.endpoints[0].address) + 1));
-
-                        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
-                        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
-
-                        let ptr = self.command_ring.as_mut().expect("").push(
-                            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
-                        );
-                        self.wait_command_complete(ptr).expect("command_complete");
                     }
 
                     debug!("slot state = {}", self.device_contexts[port.slot_id as usize - 1].as_ref().unwrap().get_slot().slot_state);
