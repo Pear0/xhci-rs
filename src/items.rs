@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use core::fmt;
 
 #[derive(Clone, Debug, Default)]
 pub struct Port {
@@ -56,4 +57,30 @@ pub enum TransferDirection<'a> {
     None
 }
 
+impl<'a> TransferDirection<'a> {
+    pub fn len(&self) -> usize {
+        match &self {
+            TransferDirection::Read(r) => r.len(),
+            TransferDirection::Write(w) => w.len(),
+            TransferDirection::None => 0,
+        }
+    }
 
+    pub fn clone_mut(&mut self) -> TransferDirection<'_> {
+        match self {
+            TransferDirection::Read(r) => TransferDirection::Read(r),
+            TransferDirection::Write(w) => TransferDirection::Write(w),
+            TransferDirection::None => TransferDirection::None,
+        }
+    }
+}
+
+impl<'a> fmt::Debug for TransferDirection<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TransferDirection::Read(s) => write!(f, "Read(len: {})", s.len()),
+            TransferDirection::Write(s) => write!(f, "Write(len: {})", s.len()),
+            TransferDirection::None => write!(f, "None"),
+        }
+    }
+}

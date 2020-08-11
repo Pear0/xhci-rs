@@ -117,11 +117,11 @@ pub struct TransferEventTRBStatusWord {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TransferEventTRB {
-    ptr: u64,
+    pub trb_pointer: u64,
     pub status: TransferEventTRBStatusWord,
-    flags: u16,
-    endpoint: u8,
-    slot: u8,
+    pub flags: u16,
+    pub endpoint: u8,
+    pub slot: u8,
 }
 
 #[repr(C)]

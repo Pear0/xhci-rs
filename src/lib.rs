@@ -32,7 +32,7 @@ use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::items::{Port, TransferDirection};
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, XHCIRing, XHCIRingSegment, SlotContext};
-use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TRB, TRBType};
+use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TRB, TRBType, TransferEventTRB};
 use crate::trb::TRBType::TransferEvent;
 use crate::quirks::XHCIQuirks;
 
@@ -934,6 +934,92 @@ impl<'a> Xhci<'a> {
         Ok(result)
     }
 
+    fn trigger_ring_doorbell(&mut self, ring: (u8, u8)) {
+        self.get_doorbell_register(ring.0).reg.write(ring.1 as u32 + 1);
+    }
+
+    fn wait_for_transfer_event(&mut self, ptr: u64) -> Option<TransferEventTRB> {
+        self.hal.memory_barrier();
+        loop {
+            let trb = self.poll_event_ring_trb()?;
+            match trb {
+                TRBType::TransferEvent(c) => {
+                    if c.trb_pointer == ptr {
+                        debug!("Got transfer event: {:?} -> bytes remain: {}", c, c.status.get_bytes_remain());
+                        let code = c.status.get_code();
+                        if code != 1 {
+                            panic!("EHHHH WTF: {:?}", TRBCompletionCode::from(code));
+                        }
+                        return Some(c);
+                    } else {
+                        debug!("trb_pointer badddddd: {:?}", c);
+                    }
+                }
+                e => {
+                    debug!("Lol: {:?}", e);
+                }
+            }
+        }
+    }
+
+    fn transfer_single_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferDirection) -> Result<usize, Error> {
+        debug!("transfer_single_bulk_ring(ring:{:?}, transfer:{:?})", ring, transfer);
+        let mut my_read_buffer = Box::new([0u8; 512]);
+
+        let max_packet_size = 64;
+        let packet_size = core::cmp::min(max_packet_size, transfer.len());
+        let my_buffer = &mut my_read_buffer[..packet_size];
+
+        if let TransferDirection::Write(slice) = &transfer {
+            my_buffer.copy_from_slice(&slice[..packet_size]);
+            self.flush_slice(my_buffer.as_ref(), FlushType::Clean);
+        }
+
+        if let TransferDirection::Read(_) = &mut transfer {
+            self.flush_slice(my_buffer.as_ref(), FlushType::Invalidate);
+        }
+
+        let transfer_ring = self.transfer_rings.get(&ring).unwrap();
+        let mut transfer_ring = transfer_ring.lock();
+
+        let normal = NormalTRB::new(self.hal, my_buffer.as_ref(), my_buffer.len());
+
+        let ptr = transfer_ring.push(TRB { normal });
+
+        core::mem::drop(transfer_ring);
+
+        self.trigger_ring_doorbell(ring);
+
+        let event = self.wait_for_transfer_event(ptr).ok_or(Error::Str("timed out waiting for transfer response"))?;
+        let amount_transferred = packet_size - event.status.get_bytes_remain() as usize;
+
+        if let TransferDirection::Read(slice) = &mut transfer {
+            self.flush_slice(my_buffer.as_ref(), FlushType::Invalidate);
+            (&mut slice[..amount_transferred]).copy_from_slice(&my_buffer[..amount_transferred]);
+        }
+
+        Ok(amount_transferred)
+    }
+
+    fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferDirection) -> Result<(), Error> {
+        loop {
+            if transfer.len() == 0 {
+                return Ok(())
+            }
+
+            let amount = self.transfer_single_bulk_ring(ring, transfer.clone_mut())?;
+            if amount == 0 {
+                return Err(Error::Str("transferred zero bytes, giving up"));
+            }
+
+            transfer = match transfer {
+                TransferDirection::Read(slice) => TransferDirection::Read(&mut slice[amount..]),
+                TransferDirection::Write(slice) => TransferDirection::Write(&slice[amount..]),
+                TransferDirection::None => TransferDirection::None,
+            };
+        }
+    }
+
     fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, Error> {
         self.reset_port(&port)?;
         let slot = self.send_slot_enable()? as usize;
@@ -1062,7 +1148,32 @@ impl<'a> Xhci<'a> {
                     let input_ring = input_ring.ok_or(Error::Str("MSD has no bulk input endpoint"))?;
                     let output_ring = output_ring.ok_or(Error::Str("MSD has no bulk output endpoint"))?;
 
-                    debug!("MSD endpoints intialized with bulk_in:{:?} bulk_out:{:?}", input_ring, output_ring);
+                    debug!("MSD endpoints initialized with bulk_in:{:?} bulk_out:{:?}", input_ring, output_ring);
+
+                    let mut buf: Vec<u8> = Vec::new();
+                    buf.resize(31, 0);
+
+                    let t = [0x55, 0x53, 0x42, 0x43, 0x13, 0x37, 0x04, 0x20, 0x24, 0x00, 0x00, 0x00, 0x80, 0x00, 6, 0x12, 0x00, 0x00, 0x00, 0x24, 0x00];
+                    (&mut buf[..t.len()]).copy_from_slice(&t);
+
+                    let r = self.transfer_bulk_ring(output_ring, TransferDirection::Write(buf.as_ref()));
+                    info!("Transfer Result: {:?}", r);
+
+                    let mut buf: Vec<u8> = Vec::new();
+                    buf.resize(36, 0);
+
+                    let r = self.transfer_bulk_ring(input_ring, TransferDirection::Read(buf.as_mut()));
+                    info!("Transfer Result: {:?}", r);
+                    info!("Got: {:x?}", buf.as_slice());
+
+                    let mut buf: Vec<u8> = Vec::new();
+                    buf.resize(13, 0);
+
+                    let r = self.transfer_bulk_ring(input_ring, TransferDirection::Read(buf.as_mut()));
+                    info!("Transfer Result: {:?}", r);
+                    info!("Got: {:x?}", buf.as_slice());
+
+                    self.hal.sleep(Duration::from_secs(5));
 
 
                 }
@@ -1116,38 +1227,30 @@ impl<'a> Xhci<'a> {
 
                     let index = self.get_epctx_index(interface.endpoints[0].address);
 
-                    for i in 0..10 {
-                        // debug!("set hid report");
-                        // match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
-                        //     Ok(_) => {
-                        //         info!("set_hid success");
-                        //     }
-                        //     Err(e) => {
-                        //         warn!("set_hid: failed to read: {:?}", e);
-                        //     }
-                        // }
-
-                        debug!("fetch hid report");
-                        let mut buf = Box::new([0u8; 128]);
-                        match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, &mut buf[0..8]) {
-                            Ok(_) => {
-                                info!("got response: {:?}", &buf[0..8]);
-                            }
-                            Err(e) => {
-                                warn!("failed to read: {:?}", e);
-                            }
-                        }
-
-                        // {
-                        //     let ring = self.transfer_rings.get(&(port.slot_id, index)).unwrap();
-                        //     let mut ring = ring.lock();
-                        //     while let Some(trb) = ring.pop(false) {
-                        //         debug!("Got keyboard interrupt trb: {:?}", unsafe { trb.normal });
-                        //     }
-                        // }
-
-                        self.hal.sleep(Duration::from_millis(500));
-                    }
+                    // for i in 0..10 {
+                    //     // debug!("set hid report");
+                    //     // match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
+                    //     //     Ok(_) => {
+                    //     //         info!("set_hid success");
+                    //     //     }
+                    //     //     Err(e) => {
+                    //     //         warn!("set_hid: failed to read: {:?}", e);
+                    //     //     }
+                    //     // }
+                    //
+                    //     debug!("fetch hid report");
+                    //     let mut buf = Box::new([0u8; 128]);
+                    //     match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, &mut buf[0..8]) {
+                    //         Ok(_) => {
+                    //             info!("got response: {:?}", &buf[0..8]);
+                    //         }
+                    //         Err(e) => {
+                    //             warn!("failed to read: {:?}", e);
+                    //         }
+                    //     }
+                    //
+                    //     self.hal.sleep(Duration::from_millis(500));
+                    // }
                 }
                 CLASS_CODE_HUB => {
                     if interface.endpoints.len() == 0 {
