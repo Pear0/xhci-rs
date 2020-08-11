@@ -146,6 +146,11 @@ pub const EP_CTX_EPTYPE_MASK: u8 = 0b111 << EP_CTX_EPTYPE_SHIFT;
 pub const EP_CTX_INTERVAL_SHIFT: u32 = 16;
 pub const EP_CTX_INTERVAL_MASK: u32 = 0xFF << EP_CTX_INTERVAL_SHIFT;
 
+pub const EP_ATTR_CONTROL: u8 = 0;
+pub const EP_ATTR_ISOCH: u8 = 1;
+pub const EP_ATTR_BULK: u8 = 2;
+pub const EP_ATTR_INTERRUPT: u8 = 3;
+
 pub const EP_TYPE_NOT_VALID: u8 = 0;
 pub const EP_TYPE_ISOCH_OUT: u8 = 1;
 pub const EP_TYPE_BULK_OUT: u8 = 2;

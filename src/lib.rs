@@ -345,7 +345,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn get_epctx_index(&self, endpoint_address: u8) -> u8 {
-        let is_in = (endpoint_address & 0x80 != 0);
+        let is_in = Self::is_ep_input(endpoint_address);
         if endpoint_address == 0 {
             0
         } else {
@@ -353,9 +353,13 @@ impl<'a> Xhci<'a> {
         }
     }
 
+    fn is_ep_input(endpoint_address: u8) -> bool {
+        endpoint_address & 0x80 != 0
+    }
+
     fn configure_endpoint(&mut self, slot_id: u8, input_ctx: &mut InputContext,
                           endpoint_address: u8, endpoint_type: u8, max_packet_size: u16,
-                          interval: u8, esit_payload_size: u32) {
+                          interval: u8, esit_payload_size: u32) -> (u8, u8) {
         let transfer_ring = XHCIRing::new_with_capacity(self.hal, 1, true);
         let transfer_ring_ptr = self.get_ptr::<XHCIRingSegment>(transfer_ring.segments[0].as_ref());
         assert_eq!(transfer_ring_ptr & 0b1111, 0, "alignment");
@@ -390,6 +394,7 @@ impl<'a> Xhci<'a> {
         input_ctx.get_input_mut()[1] |= 0b1 << (index + 1);
 
         self.transfer_rings.insert((slot_id, index), Arc::new(Mutex::new(transfer_ring)));
+        (slot_id, index)
     }
 
     fn create_slot_context(&mut self, input_ctx: &mut InputContext, port: &Port, speed: u8, max_packet_size: u16) {
@@ -902,7 +907,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn with_input_context<F: FnOnce(&mut Self, &mut InputContext) -> Result<(), Error>>(&mut self, port: &Port, func: F) -> Result<(), Error> {
+    fn with_input_context<R, F: FnOnce(&mut Self, &mut InputContext) -> Result<R, Error>>(&mut self, port: &Port, func: F) -> Result<R, Error> {
         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
 
         let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
@@ -914,7 +919,7 @@ impl<'a> Xhci<'a> {
             *input_ctx.get_endpoint_mut(i) = ctx.get_endpoint(i).clone();
         }
 
-        func(self, input_ctx.as_mut())?;
+        let result = func(self, input_ctx.as_mut())?;
 
         // always update slot context
         input_ctx.get_input_mut()[1] |= 1;
@@ -926,7 +931,7 @@ impl<'a> Xhci<'a> {
             TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
         );
         self.wait_command_complete(ptr).ok_or(Error::Str("command did not complete"))?;
-        Ok(())
+        Ok(result)
     }
 
     fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, Error> {
@@ -1024,19 +1029,40 @@ impl<'a> Xhci<'a> {
                         continue;
                     }
 
+                    let mut input_ring: Option<(u8, u8)> = None;
+                    let mut output_ring: Option<(u8, u8)> = None;
+
                     self.with_input_context(port, |this, input_ctx| {
 
-                        this.configure_endpoint(port.slot_id, input_ctx,
-                                                interface.endpoints[0].address,
-                                                EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
-                                                interface.endpoints[0].interval, this.get_max_esti_payload(&interface.endpoints[0]));
+                        for endpoint in interface.endpoints.iter() {
+                            if endpoint.attr != EP_ATTR_BULK {
+                                continue;
+                            }
 
+                            let typ = if Self::is_ep_input(endpoint.address) { EP_TYPE_BULK_IN } else { EP_TYPE_BULK_OUT };
+
+                            let ring = this.configure_endpoint(port.slot_id, input_ctx,
+                                                    endpoint.address,
+                                                    typ, endpoint.max_packet_size,
+                                                    endpoint.interval, this.get_max_esti_payload(endpoint));
+
+                            if Self::is_ep_input(endpoint.address) {
+                                input_ring = Some(ring);
+                            } else {
+                                output_ring = Some(ring);
+                            }
+                        }
 
                         input_ctx.set_configure_ep_meta(configuration.config.config_val,
                                                         interface.interface.interface_number, interface.interface.alt_set);
 
                         Ok(())
                     })?;
+
+                    let input_ring = input_ring.ok_or(Error::Str("MSD has no bulk input endpoint"))?;
+                    let output_ring = output_ring.ok_or(Error::Str("MSD has no bulk output endpoint"))?;
+
+                    debug!("MSD endpoints intialized with bulk_in:{:?} bulk_out:{:?}", input_ring, output_ring);
 
 
                 }
