@@ -23,28 +23,29 @@ use core::ptr::NonNull;
 use core::time::Duration;
 
 use hashbrown::HashMap;
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 use volatile::*;
+
+use usb_host::descriptor::*;
+use usb_host::items::{Port, EndpointType};
 
 use crate::consts::*;
 use crate::descriptor::{USBConfigurationDescriptor, USBConfigurationDescriptorSet, USBDeviceDescriptor, USBEndpointDescriptor, USBHubDescriptor, USBInterfaceDescriptor, USBInterfaceDescriptorSet};
 use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::items::{Port, TransferDirection};
-use crate::registers::{DoorBellRegister, InterrupterRegisters};
-use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, XHCIRing, XHCIRingSegment, SlotContext};
-use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TRB, TRBType, TransferEventTRB};
-use crate::trb::TRBType::TransferEvent;
 use crate::quirks::XHCIQuirks;
-
-#[macro_use]
-mod macros;
+use crate::registers::{DoorBellRegister, InterrupterRegisters};
+use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, SlotContext, XHCIRing, XHCIRingSegment};
+use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TransferEventTRB, TRB, TRBType};
+use crate::trb::TRBType::TransferEvent;
+use usb_host::traits::{USBHostController, USBPipe, USBMeta};
+use usb_host::structs::USBDevice;
+use downcast_rs::Downcast;
 
 pub mod quirks;
 #[macro_use]
 pub(crate) mod consts;
-pub(crate) mod descriptor;
 pub(crate) mod extended_capability;
-pub(crate) mod items;
 pub(crate) mod registers;
 pub(crate) mod structs;
 pub(crate) mod trb;
@@ -1004,7 +1005,7 @@ impl<'a> Xhci<'a> {
     fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferDirection) -> Result<(), Error> {
         loop {
             if transfer.len() == 0 {
-                return Ok(())
+                return Ok(());
             }
 
             let amount = self.transfer_single_bulk_ring(ring, transfer.clone_mut())?;
@@ -1119,7 +1120,6 @@ impl<'a> Xhci<'a> {
                     let mut output_ring: Option<(u8, u8)> = None;
 
                     self.with_input_context(port, |this, input_ctx| {
-
                         for endpoint in interface.endpoints.iter() {
                             if endpoint.attr != EP_ATTR_BULK {
                                 continue;
@@ -1128,9 +1128,9 @@ impl<'a> Xhci<'a> {
                             let typ = if Self::is_ep_input(endpoint.address) { EP_TYPE_BULK_IN } else { EP_TYPE_BULK_OUT };
 
                             let ring = this.configure_endpoint(port.slot_id, input_ctx,
-                                                    endpoint.address,
-                                                    typ, endpoint.max_packet_size,
-                                                    endpoint.interval, this.get_max_esti_payload(endpoint));
+                                                               endpoint.address,
+                                                               typ, endpoint.max_packet_size,
+                                                               endpoint.interval, this.get_max_esti_payload(endpoint));
 
                             if Self::is_ep_input(endpoint.address) {
                                 input_ring = Some(ring);
@@ -1174,8 +1174,6 @@ impl<'a> Xhci<'a> {
                     info!("Got: {:x?}", buf.as_slice());
 
                     self.hal.sleep(Duration::from_secs(5));
-
-
                 }
                 CLASS_CODE_HID => {
                     if interface.interface.sub_class != 1 {
@@ -1282,7 +1280,6 @@ impl<'a> Xhci<'a> {
                     // Reconfigure to hub
                     {
                         self.with_input_context(port, |_this, input_ctx| {
-
                             let mut slot_ctx = input_ctx.get_slot_mut();
                             slot_ctx.dword1.set_hub(true);
                             slot_ctx.numbr_ports = hub_descriptor.num_ports;
@@ -1294,7 +1291,6 @@ impl<'a> Xhci<'a> {
                         })?;
 
                         self.with_input_context(port, |this, input_ctx| {
-
                             this.configure_endpoint(port.slot_id, input_ctx,
                                                     interface.endpoints[0].address,
                                                     EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
@@ -1305,7 +1301,6 @@ impl<'a> Xhci<'a> {
 
                             Ok(())
                         })?;
-
                     }
 
                     debug!("slot state = {}", self.device_contexts[port.slot_id as usize - 1].as_ref().unwrap().get_slot().slot_state);
@@ -1719,6 +1714,91 @@ impl<'a> Xhci<'a> {
             tmp_slice.copy_from_slice(&buf);
         }
         thing
+    }
+}
+
+#[derive(Clone)]
+pub struct XhciWrapper(Arc<Mutex<Xhci<'static>>>);
+
+struct USBDeviceMeta {
+    pub is_root_hub: bool,
+    pub slot: u8,
+    pub port: Port,
+}
+
+impl USBMeta for USBDeviceMeta {}
+
+impl USBHostController for XhciWrapper {
+    fn register_root_hub(&self, device: &Arc<RwLock<USBDevice>>) {
+        let device = device.write();
+        device.prv = Some(Box::new(USBDeviceMeta {
+            is_root_hub: true,
+            slot: 0,
+            port: Port::new_from_root(0), // fake port
+        }));
+    }
+
+    fn pipe_open(&self, device: &Arc<RwLock<USBDevice>>, endpoint: Option<&USBEndpointDescriptor>) -> Result<Arc<RwLock<USBPipe>>, usb_host::items::Error> {
+        let device = device.write();
+
+        let endpoint_type = match endpoint {
+            None => EndpointType::Control,
+            Some(d) => match d.descriptor_type {
+                0 => EndpointType::Control,
+                1 => EndpointType::Isochronous,
+                2 => EndpointType::Bulk,
+                3 => EndpointType::Interrupt,
+                d => panic!("bad descriptor_type: {}", d),
+            }
+        };
+
+        let f = device.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+        if f.is_root_hub {
+            assert!(matches!(endpoint, None));
+            return Ok(Arc::new(RwLock::new(USBPipe { endpoint_type: EndpointType::Control })));
+        }
+
+        match endpoint_type {
+            EndpointType::Control => {
+
+                let mut x = self.0.lock();
+
+                let slot = x.send_slot_enable()? as usize;
+
+                let mut f = device.prv.as_mut().unwrap().downcast_mut::<USBDeviceMeta>().unwrap();
+                f.port.slot_id = slot as u8;
+
+                x.setup_slot(&f.port, device.speed, device.max_packet_size, true);
+
+
+            },
+            EndpointType::Isochronous => {},
+            EndpointType::Bulk => {},
+            EndpointType::Interrupt => {},
+        }
+
+        Err(usb_host::items::Error::Str("bad"))
+    }
+
+    fn set_address(&self, device: &Arc<RwLock<USBDevice>>) {
+
+        let device = device.write();
+        let f = device.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+        if f.is_root_hub {
+            return;
+        }
+
+        let mut x = self.0.lock();
+        x.setup_slot(&f.port, device.speed, device.max_packet_size, false);
+
+    }
+
+    fn reset_port(&self, device: &Arc<RwLock<USBDevice>>, port: u8) {
+        unimplemented!()
+    }
+
+    fn control_transfer(&self, endpoint: Arc<RwLock<USBPipe>>) {
+        unimplemented!()
     }
 }
 
