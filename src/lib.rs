@@ -11,6 +11,8 @@
 
 extern crate alloc;
 #[macro_use]
+extern crate usb_host;
+#[macro_use]
 extern crate log;
 
 use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
@@ -27,12 +29,10 @@ use spin::{Mutex, RwLock};
 use volatile::*;
 
 use usb_host::descriptor::*;
-use usb_host::items::{Port, EndpointType};
+use usb_host::items::{Port, EndpointType, TypeTriple, ControlCommand, TransferBuffer};
 
 use crate::consts::*;
-use crate::descriptor::{USBConfigurationDescriptor, USBConfigurationDescriptorSet, USBDeviceDescriptor, USBEndpointDescriptor, USBHubDescriptor, USBInterfaceDescriptor, USBInterfaceDescriptorSet};
 use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
-use crate::items::{Port, TransferDirection};
 use crate::quirks::XHCIQuirks;
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, SlotContext, XHCIRing, XHCIRingSegment};
@@ -41,6 +41,7 @@ use crate::trb::TRBType::TransferEvent;
 use usb_host::traits::{USBHostController, USBPipe, USBMeta};
 use usb_host::structs::USBDevice;
 use downcast_rs::Downcast;
+use usb_host::items::TransferDirection::HostToDevice;
 
 pub mod quirks;
 #[macro_use]
@@ -118,8 +119,17 @@ fn get_registers<T>(base: u64) -> &'static mut T {
     unsafe { &mut *(base as *mut T) }
 }
 
-fn as_slice<T>(t: &mut T) -> &mut [u8] {
+fn as_mut_slice<T>(t: &mut T) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(t as *mut T as *mut u8, core::mem::size_of::<T>()) }
+}
+
+fn as_slice<T>(t: &T) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(t as *const T as *const u8, core::mem::size_of::<T>()) }
+}
+
+fn copy_from_slice(dest: &mut [u8], src: &[u8]) {
+    let amount = core::cmp::min(dest.len(), src.len());
+    dest[..amount].copy_from_slice(&src[..amount]);
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -599,20 +609,20 @@ impl<'a> Xhci<'a> {
     }
 
     fn send_transfer(&mut self, slot_id: u8, endpoint: u8, request_type: u8, request: u8,
-                     value: u16, index: u16, length: u16, transfer: TransferDirection)
+                     value: u16, index: u16, length: u16, transfer: TransferBuffer)
                      -> Result<usize, Error>
     {
         match &transfer {
             // TODO maybe don't always use DC CIVAC...
-            TransferDirection::Read(read) => self.flush_slice(read, FlushType::Invalidate),
-            TransferDirection::Write(write) => self.flush_slice(write, FlushType::Clean),
+            TransferBuffer::Read(read) => self.flush_slice(read, FlushType::Invalidate),
+            TransferBuffer::Write(write) => self.flush_slice(write, FlushType::Clean),
             _ => {}
         }
 
         let setup_trt = match &transfer {
-            TransferDirection::Read(_) => 3,
-            TransferDirection::Write(_) => 2,
-            TransferDirection::None => 0,
+            TransferBuffer::Read(_) => 3,
+            TransferBuffer::Write(_) => 2,
+            TransferBuffer::None => 0,
         };
 
         let mut setup = SetupStageTRB {
@@ -635,26 +645,26 @@ impl<'a> Xhci<'a> {
             ring.push(TRB { setup });
         }
 
-        if !matches!(&transfer, TransferDirection::None) {
+        if !matches!(&transfer, TransferBuffer::None) {
             // Data TRB
             let mut data = DataStageTRB::default();
 
             match &transfer {
-                TransferDirection::Read(read) => {
+                TransferBuffer::Read(read) => {
                     data.buffer = self.hal.translate_addr(read.as_ptr() as u64);
                 }
-                TransferDirection::Write(write) => {
+                TransferBuffer::Write(write) => {
                     data.buffer = self.hal.translate_addr(write.as_ptr() as u64);
                 }
-                TransferDirection::None => panic!(),
+                TransferBuffer::None => panic!(),
             }
 
             data.params.set_transfer_size(match &transfer {
-                TransferDirection::Read(read) => read.len() as u32,
-                TransferDirection::Write(write) => write.len() as u32,
-                TransferDirection::None => 0,
+                TransferBuffer::Read(read) => read.len() as u32,
+                TransferBuffer::Write(write) => write.len() as u32,
+                TransferBuffer::None => 0,
             });
-            data.meta.set_read(matches!(&transfer, TransferDirection::Read(_)));
+            data.meta.set_read(matches!(&transfer, TransferBuffer::Read(_)));
             data.meta.set_trb_type(TRB_TYPE_DATA as u8);
             // TODO sketchies
             // data.meta.set_eval_next(true);
@@ -698,12 +708,12 @@ impl<'a> Xhci<'a> {
                     TRBType::TransferEvent(t) => {
                         let bytes_remain = t.status.get_bytes_remain() as usize;
                         let bytes_requested = match &transfer {
-                            TransferDirection::Read(read) => read.len(),
-                            TransferDirection::Write(write) => write.len(),
-                            TransferDirection::None => 0,
+                            TransferBuffer::Read(read) => read.len(),
+                            TransferBuffer::Write(write) => write.len(),
+                            TransferBuffer::None => 0,
                         };
 
-                        if let TransferDirection::Read(read) = &transfer {
+                        if let TransferBuffer::Read(read) = &transfer {
                             self.flush_slice(read, FlushType::Invalidate);
                         }
 
@@ -744,10 +754,10 @@ impl<'a> Xhci<'a> {
         let mut hub_descriptor = USBHubDescriptor::default();
         let desc_type = if device_descriptor.get_max_packet_size() >= 512 { DESCRIPTOR_TYPE_SS_HUB } else { DESCRIPTOR_TYPE_HUB };
 
-        self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_slice(&mut hub_descriptor))[..4])?;
+        self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_mut_slice(&mut hub_descriptor))[..4])?;
 
         let length = hub_descriptor.length as usize;
-        self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_slice(&mut hub_descriptor))[..length])?;
+        self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_mut_slice(&mut hub_descriptor))[..length])?;
 
         Ok(hub_descriptor)
     }
@@ -809,7 +819,7 @@ impl<'a> Xhci<'a> {
     fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, Error> {
         let mut status = PortStatus::default();
         assert_eq!(Into::<u8>::into(request_type!(DeviceToHost, Class, Other)), 0xA3u8);
-        self.send_control_command(slot_id, request_type!(DeviceToHost, Class, Other), REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(as_slice(&mut status)))?;
+        self.send_control_command(slot_id, request_type!(DeviceToHost, Class, Other), REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(as_mut_slice(&mut status)))?;
         Ok(status)
     }
 
@@ -895,7 +905,6 @@ impl<'a> Xhci<'a> {
     }
 
     fn get_max_esti_payload(&self, epdesc: &USBEndpointDescriptor) -> u32 {
-        use crate::descriptor::USBEndpointTransferType;
         match epdesc.transfer_type() {
             USBEndpointTransferType::Control |
             USBEndpointTransferType::Bulk => {
@@ -963,7 +972,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn transfer_single_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferDirection) -> Result<usize, Error> {
+    fn transfer_single_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> Result<usize, Error> {
         debug!("transfer_single_bulk_ring(ring:{:?}, transfer:{:?})", ring, transfer);
         let mut my_read_buffer = Box::new([0u8; 512]);
 
@@ -971,12 +980,12 @@ impl<'a> Xhci<'a> {
         let packet_size = core::cmp::min(max_packet_size, transfer.len());
         let my_buffer = &mut my_read_buffer[..packet_size];
 
-        if let TransferDirection::Write(slice) = &transfer {
+        if let TransferBuffer::Write(slice) = &transfer {
             my_buffer.copy_from_slice(&slice[..packet_size]);
             self.flush_slice(my_buffer.as_ref(), FlushType::Clean);
         }
 
-        if let TransferDirection::Read(_) = &mut transfer {
+        if let TransferBuffer::Read(_) = &mut transfer {
             self.flush_slice(my_buffer.as_ref(), FlushType::Invalidate);
         }
 
@@ -994,7 +1003,7 @@ impl<'a> Xhci<'a> {
         let event = self.wait_for_transfer_event(ptr).ok_or(Error::Str("timed out waiting for transfer response"))?;
         let amount_transferred = packet_size - event.status.get_bytes_remain() as usize;
 
-        if let TransferDirection::Read(slice) = &mut transfer {
+        if let TransferBuffer::Read(slice) = &mut transfer {
             self.flush_slice(my_buffer.as_ref(), FlushType::Invalidate);
             (&mut slice[..amount_transferred]).copy_from_slice(&my_buffer[..amount_transferred]);
         }
@@ -1002,7 +1011,7 @@ impl<'a> Xhci<'a> {
         Ok(amount_transferred)
     }
 
-    fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferDirection) -> Result<(), Error> {
+    fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> Result<(), Error> {
         loop {
             if transfer.len() == 0 {
                 return Ok(());
@@ -1014,9 +1023,9 @@ impl<'a> Xhci<'a> {
             }
 
             transfer = match transfer {
-                TransferDirection::Read(slice) => TransferDirection::Read(&mut slice[amount..]),
-                TransferDirection::Write(slice) => TransferDirection::Write(&slice[amount..]),
-                TransferDirection::None => TransferDirection::None,
+                TransferBuffer::Read(slice) => TransferBuffer::Read(&mut slice[amount..]),
+                TransferBuffer::Write(slice) => TransferBuffer::Write(&slice[amount..]),
+                TransferBuffer::None => TransferBuffer::None,
             };
         }
     }
@@ -1156,20 +1165,20 @@ impl<'a> Xhci<'a> {
                     let t = [0x55, 0x53, 0x42, 0x43, 0x13, 0x37, 0x04, 0x20, 0x24, 0x00, 0x00, 0x00, 0x80, 0x00, 6, 0x12, 0x00, 0x00, 0x00, 0x24, 0x00];
                     (&mut buf[..t.len()]).copy_from_slice(&t);
 
-                    let r = self.transfer_bulk_ring(output_ring, TransferDirection::Write(buf.as_ref()));
+                    let r = self.transfer_bulk_ring(output_ring, TransferBuffer::Write(buf.as_ref()));
                     info!("Transfer Result: {:?}", r);
 
                     let mut buf: Vec<u8> = Vec::new();
                     buf.resize(36, 0);
 
-                    let r = self.transfer_bulk_ring(input_ring, TransferDirection::Read(buf.as_mut()));
+                    let r = self.transfer_bulk_ring(input_ring, TransferBuffer::Read(buf.as_mut()));
                     info!("Transfer Result: {:?}", r);
                     info!("Got: {:x?}", buf.as_slice());
 
                     let mut buf: Vec<u8> = Vec::new();
                     buf.resize(13, 0);
 
-                    let r = self.transfer_bulk_ring(input_ring, TransferDirection::Read(buf.as_mut()));
+                    let r = self.transfer_bulk_ring(input_ring, TransferBuffer::Read(buf.as_mut()));
                     info!("Transfer Result: {:?}", r);
                     info!("Got: {:x?}", buf.as_slice());
 
@@ -1701,6 +1710,65 @@ impl<'a> Xhci<'a> {
         }
     }
 
+    fn handle_root_hub_command(&mut self, command: ControlCommand) -> Result<(), Error> {
+
+        /*
+
+
+        self.wait_until(Error::Str("failed to reset port"), PORT_RESET_TIMEOUT, |this| {
+            let val = this.op.get_port_operational_register(port_id).portsc.read();
+            (val & OP_PORT_STATUS_RESET_MASK == 0) && (OP_PORT_STATUS_PRC_MASK != 0)
+        })?;
+
+fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, Error> {
+        let mut status = PortStatus::default();
+        assert_eq!(Into::<u8>::into(request_type!(DeviceToHost, Class, Other)), 0xA3u8);
+        self.send_control_command(slot_id, request_type!(DeviceToHost, Class, Other), REQUEST_GET_STATUS, 0, port_id as u16, 4, None, Some(as_slice(&mut status)))?;
+        Ok(status)
+    }
+
+         */
+        let port = command.index as u8;
+
+        match (command.request_type, command.request) {
+            (request_type!(HostToDevice, Class, Other), REQUEST_SET_FEATURE) => {
+                assert_eq!(command.value, FEATURE_PORT_RESET as u16);
+                self.op.get_port_operational_register(port).portsc.update(|tmp| {
+                    *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
+                    *tmp |= OP_PORT_STATUS_RESET_MASK | OP_PORT_STATUS_PRC_MASK;
+                });
+            }
+            (request_type!(HostToDevice, Class, Other), REQUEST_CLEAR_FEATURE) => {
+                assert_eq!(command.value, FEATURE_C_PORT_RESET as u16);
+                self.op.get_port_operational_register(port).portsc.update(|tmp| {
+                    *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
+                    *tmp |= OP_PORT_STATUS_PRC_MASK;
+                });
+            }
+            (request_type!(DeviceToHost, Class, Other), REQUEST_GET_STATUS) => {
+                let mut status = PortStatus::default();
+
+                let val = self.op.get_port_operational_register(port).portsc.read();
+                if (val & OP_PORT_STATUS_RESET_MASK == 0) && (OP_PORT_STATUS_PRC_MASK != 0) {
+                    status.set_change_reset(true);
+                }
+
+                if let TransferBuffer::Read(slice) = command.buffer {
+                    copy_from_slice(slice, as_slice(&status));
+                } else {
+                    panic!("got a {:?} buffer on a REQUEST_GET_STATUS command", command.buffer);
+                }
+
+            }
+            _ => {
+                panic!("got unknown command for hub: {:?}", command);
+            }
+        }
+
+
+        Ok(())
+    }
+
     fn into_type<T: Sized>(buf: &[u8]) -> T {
         let mut thing: T = unsafe { core::mem::zeroed() };
         {
@@ -1717,8 +1785,7 @@ impl<'a> Xhci<'a> {
     }
 }
 
-#[derive(Clone)]
-pub struct XhciWrapper(Arc<Mutex<Xhci<'static>>>);
+pub struct XhciWrapper(pub Mutex<Xhci<'static>>);
 
 struct USBDeviceMeta {
     pub is_root_hub: bool,
@@ -1730,7 +1797,7 @@ impl USBMeta for USBDeviceMeta {}
 
 impl USBHostController for XhciWrapper {
     fn register_root_hub(&self, device: &Arc<RwLock<USBDevice>>) {
-        let device = device.write();
+        let mut device = device.write();
         device.prv = Some(Box::new(USBDeviceMeta {
             is_root_hub: true,
             slot: 0,
@@ -1739,7 +1806,7 @@ impl USBHostController for XhciWrapper {
     }
 
     fn pipe_open(&self, device: &Arc<RwLock<USBDevice>>, endpoint: Option<&USBEndpointDescriptor>) -> Result<Arc<RwLock<USBPipe>>, usb_host::items::Error> {
-        let device = device.write();
+        let mut dev_lock = device.write();
 
         let endpoint_type = match endpoint {
             None => EndpointType::Control,
@@ -1752,10 +1819,10 @@ impl USBHostController for XhciWrapper {
             }
         };
 
-        let f = device.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+        let f = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
             assert!(matches!(endpoint, None));
-            return Ok(Arc::new(RwLock::new(USBPipe { endpoint_type: EndpointType::Control })));
+            return Ok(Arc::new(RwLock::new(USBPipe { index: 0, endpoint_type: EndpointType::Control })));
         }
 
         match endpoint_type {
@@ -1763,13 +1830,17 @@ impl USBHostController for XhciWrapper {
 
                 let mut x = self.0.lock();
 
-                let slot = x.send_slot_enable()? as usize;
+                let slot = x.send_slot_enable().unwrap() as usize;
 
-                let mut f = device.prv.as_mut().unwrap().downcast_mut::<USBDeviceMeta>().unwrap();
+                let (speed, max_packet_size) = (dev_lock.speed, dev_lock.max_packet_size);
+                assert_ne!(speed, 0);
+                assert_ne!(max_packet_size, 0);
+
+                let mut f = dev_lock.prv.as_mut().unwrap().downcast_mut::<USBDeviceMeta>().unwrap();
                 f.port.slot_id = slot as u8;
+                f.slot = slot as u8;
 
-                x.setup_slot(&f.port, device.speed, device.max_packet_size, true);
-
+                x.setup_slot(&f.port, speed, max_packet_size, true);
 
             },
             EndpointType::Isochronous => {},
@@ -1793,12 +1864,29 @@ impl USBHostController for XhciWrapper {
 
     }
 
-    fn reset_port(&self, device: &Arc<RwLock<USBDevice>>, port: u8) {
-        unimplemented!()
-    }
+    fn control_transfer(&self, device: &Arc<RwLock<USBDevice>>, endpoint: &USBPipe, command: ControlCommand) {
+        assert_eq!(endpoint.index, 0);
+        let dev_lock = device.read();
 
-    fn control_transfer(&self, endpoint: Arc<RwLock<USBPipe>>) {
-        unimplemented!()
+        let meta = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+        if meta.is_root_hub {
+            let mut x = self.0.lock();
+            if let Err(e) = x.handle_root_hub_command(command) {
+                panic!("control_command error: {:?}", e);
+            }
+            return;
+        }
+
+        let mut x = self.0.lock();
+        let result = match command.buffer {
+            TransferBuffer::Read(slice) => x.send_control_command(meta.port.slot_id, command.request_type, command.request, command.value, command.index, command.length, None, Some(slice)),
+            TransferBuffer::Write(slice) => x.send_control_command(meta.port.slot_id, command.request_type, command.request, command.value, command.index, command.length, Some(slice), None),
+            TransferBuffer::None => x.send_control_command(meta.port.slot_id, command.request_type, command.request, command.value, command.index, command.length, None, None),
+        };
+
+        if let Err(e) = result {
+            panic!("control_command error: {:?}", e);
+        }
     }
 }
 
