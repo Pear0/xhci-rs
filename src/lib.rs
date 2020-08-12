@@ -1796,7 +1796,7 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
                         OP_PORT_STATUS_SPEED_HIGH => status.set_high_speed(true),
                         OP_PORT_STATUS_SPEED_FULL => {},
                         c => {
-                            panic!("Unknown speed: {}", c)
+                            warn!("Unknown speed: {}", c)
                         },
                     }
                 }
@@ -2007,7 +2007,7 @@ impl USBHostController for XhciWrapper {
                         root_port = dev_lock.port;
                     } else {
                         parent_slot = par_lock.addr as u8;
-                        route_string = f.route_string | (par_lock.port as u32) << (4 * (par_lock.depth - 1));
+                        route_string = f.route_string | (dev_lock.port as u32) << (4 * (par_lock.depth - 1));
                         parent_is_low_or_full_speed = par_lock.speed.is_low_or_full_speed();
                         root_port = f.root_port;
                     }
