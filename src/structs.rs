@@ -139,7 +139,7 @@ impl<'a> XHCIRing<'a> {
         (ptr_va, ptr_pa)
     }
 
-    pub fn push(&mut self, mut trb: TRB) -> u64 {
+    pub fn push(&mut self, trb: TRB) -> u64 {
         self.do_push(trb, false).1
     }
 
@@ -157,7 +157,7 @@ impl<'a> XHCIRing<'a> {
 
         assert_ne!(first_va, 0);
 
-        let mut first = unsafe { &mut *(first_va as *mut TRB) };
+        let first = unsafe { &mut *(first_va as *mut TRB) };
         first.set_cycle_state(Self::swap_cycle(first.get_cycle_state()));
 
         self.hal.flush_cache(first_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
