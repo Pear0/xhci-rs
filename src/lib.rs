@@ -928,10 +928,7 @@ impl<'a> Xhci<'a> {
 
     fn get_max_esti_payload(epdesc: &USBEndpointDescriptor) -> u32 {
         match epdesc.transfer_type() {
-            USBEndpointTransferType::Control |
-            USBEndpointTransferType::Bulk => {
-                0
-            }
+            EndpointType::Control | EndpointType::Bulk => 0,
             _ => {
                 let maxp_mult = (epdesc.wMaxPacketSize >> 11) & 0x3;
                 maxp_mult as u32 * epdesc.wMaxPacketSize as u32
@@ -2049,14 +2046,7 @@ impl USBHostController for XhciWrapper {
             Some(endpoint_desc) => {
                 let slot = dev_lock.addr as u8;
 
-                let endpoint_type = match endpoint_desc.bmAttributes & 0b11 {
-                    0 => EndpointType::Control,
-                    1 => EndpointType::Isochronous,
-                    2 => EndpointType::Bulk,
-                    3 => EndpointType::Interrupt,
-                    _ => panic!("unreachable"),
-                };
-
+                let endpoint_type = endpoint_desc.transfer_type();
                 let endpoint_index = Xhci::get_epctx_index(endpoint_desc.bEndpointAddress);
                 let endpoint_is_input = Xhci::is_ep_input(endpoint_desc.bEndpointAddress);
 
