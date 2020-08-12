@@ -153,7 +153,7 @@ pub enum FlushType {
     CleanAndInvalidate,
 }
 
-pub trait HAL {
+pub trait HAL : Send + Sync {
     fn current_time(&self) -> Duration;
     fn sleep(&self, dur: Duration);
     fn memory_barrier(&self);
