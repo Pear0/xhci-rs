@@ -472,28 +472,5 @@ impl Drop for ScratchPadBufferArray {
     }
 }
 
-#[bitfield]
-#[derive(Debug, Clone, Default)]
-pub struct PortStatus {
-    device_connected: bool,
-    port_enable: bool,
-    suspend: bool,
-    over_current: bool,
-    reset: bool,
-    __res0: B3,
-    port_power: bool,
-    low_speed: bool, // low speed bit takes precedence over high speed bit
-    high_speed: bool,
-    port_test: bool,
-    port_indicator: bool,
-    __res1: B3,
-    change_device_connected: bool,
-    change_port_enable: bool,
-    change_suspend: bool,
-    change_over_current: bool,
-    change_reset: bool,
-    __res2: B11,
-}
 
-const_assert_size!(PortStatus, 4);
 

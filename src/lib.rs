@@ -2,6 +2,7 @@
 #![feature(const_in_array_repeat_expressions)]
 #![feature(global_asm)]
 #![feature(llvm_asm)]
+#![feature(track_caller)]
 
 #![allow(dead_code, unused_imports, unused_parens)]
 
@@ -11,9 +12,9 @@
 
 extern crate alloc;
 #[macro_use]
-extern crate usb_host;
-#[macro_use]
 extern crate log;
+#[macro_use]
+extern crate usb_host;
 
 use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
 use alloc::boxed::Box;
@@ -24,24 +25,25 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 use core::time::Duration;
 
+use downcast_rs::Downcast;
 use hashbrown::HashMap;
 use spin::{Mutex, RwLock};
 use volatile::*;
 
 use usb_host::descriptor::*;
-use usb_host::items::{Port, EndpointType, TypeTriple, ControlCommand, TransferBuffer};
+use usb_host::items::{ControlCommand, EndpointType, Port, TransferBuffer, TypeTriple};
+use usb_host::items::TransferDirection::HostToDevice;
+use usb_host::structs::{USBDevice, PortStatus};
+use usb_host::traits::{USBHostController, USBMeta, USBPipe};
 
 use crate::consts::*;
 use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::quirks::XHCIQuirks;
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
-use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, PortStatus, ScratchPadBufferArray, SlotContext, XHCIRing, XHCIRingSegment};
+use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, ScratchPadBufferArray, SlotContext, XHCIRing, XHCIRingSegment};
 use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TransferEventTRB, TRB, TRBType};
 use crate::trb::TRBType::TransferEvent;
-use usb_host::traits::{USBHostController, USBPipe, USBMeta};
-use usb_host::structs::USBDevice;
-use downcast_rs::Downcast;
-use usb_host::items::TransferDirection::HostToDevice;
+use usb_host::consts::USBSpeed;
 
 pub mod quirks;
 #[macro_use]
@@ -132,6 +134,15 @@ fn copy_from_slice(dest: &mut [u8], src: &[u8]) {
     dest[..amount].copy_from_slice(&src[..amount]);
 }
 
+#[track_caller]
+fn respond_slice(command: ControlCommand, src: &[u8]) {
+    if let TransferBuffer::Read(slice) = command.buffer {
+        copy_from_slice(slice, src);
+    } else {
+        panic!("expected a Read on command: {:?}", command);
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum FlushType {
     /// Flush dirty cache lines to RAM (does not drop cache lines)
@@ -158,6 +169,17 @@ pub trait HAL {
             Global.dealloc(NonNull::new_unchecked(ptr as *mut u8), layout);
         }
     }
+}
+
+#[derive(Debug)]
+struct PortContext {
+    port: u8,
+    root_port: u8,
+    parent_slot: u8,
+    parent_is_low_or_full_speed: bool,
+    route_string: u32,
+    speed: USBSpeed,
+    max_packet_size: u16,
 }
 
 pub struct Xhci<'a> {
@@ -205,7 +227,7 @@ impl<'a> Xhci<'a> {
         info.doorbell_offset = cap.doorbell_offset.read() & CAP_DBOFFSET_MASK;
         info.runtime_offset = cap.rts_offset.read() & CAP_RTSOFFSET_MASK;
 
-        Self {
+        let mut this = Self {
             mmio_virt_base: base_address,
             cap,
             op: op_regs,
@@ -219,7 +241,10 @@ impl<'a> Xhci<'a> {
             event_ring_table: None,
             scratchpads: None,
             quirks: Default::default(),
-        }
+        };
+
+        this.do_stuff();
+        this
     }
 
     fn get_runtime_interrupt_register(&mut self, offset: u8) -> &'static mut InterrupterRegisters {
@@ -408,28 +433,30 @@ impl<'a> Xhci<'a> {
         (slot_id, index)
     }
 
-    fn create_slot_context(&mut self, input_ctx: &mut InputContext, port: &Port, speed: u8, max_packet_size: u16) {
-        input_ctx.get_slot_mut().dword1.set_speed(speed);
+    fn create_slot_context(&mut self, input_ctx: &mut InputContext, port_ctx: &PortContext) {
+        input_ctx.get_slot_mut().dword1.set_speed(speed_to_xhci(port_ctx.speed));
         input_ctx.get_slot_mut().dword1.set_context_entries(1); // TODO Maybe not hardcode 1?
-        input_ctx.get_slot_mut().root_hub_port_number = port.get_root_port_id();
-        input_ctx.get_slot_mut().dword1.set_route_string(port.construct_route_string());
+        input_ctx.get_slot_mut().root_hub_port_number = port_ctx.root_port;
+        input_ctx.get_slot_mut().dword1.set_route_string(port_ctx.route_string);
         input_ctx.get_slot_mut().slot_state = 0;
 
-        if let Some(parent) = port.parent.as_ref() {
-            if port.is_low_or_full_speed && !parent.is_low_or_full_speed {
-                input_ctx.get_slot_mut().parent_hub_slot_id = parent.slot_id;
-                input_ctx.get_slot_mut().parent_port_number = port.port_id;
+        if port_ctx.speed.is_low_or_full_speed() {
+            // root hub slot id == 0
+            if !port_ctx.parent_is_low_or_full_speed && port_ctx.parent_slot != 0 {
+                input_ctx.get_slot_mut().parent_hub_slot_id = port_ctx.parent_slot;
+                input_ctx.get_slot_mut().parent_port_number = port_ctx.port;
             }
         }
+
     }
 
-    fn setup_slot(&mut self, port: &Port, speed: u8, max_packet_size: u16, block_cmd: bool) -> Box<InputContext> {
-        debug!("setup_slot(port_id: {}, speed: {}, max_packet_size: {}, block_cmd: {})", port.port_id, speed, max_packet_size, block_cmd);
-        let slot = port.slot_id as usize;
+    fn setup_slot(&mut self, slot: u8, port_ctx: &PortContext, block_cmd: bool) -> Box<InputContext> {
+        debug!("setup_slot(slot: {}, port_ctx: {:?}, block_cmd: {})", slot, port_ctx, block_cmd);
+        let slot = slot as usize;
 
         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
 
-        if let Some(output_ctx) = self.device_contexts[port.slot_id as usize].as_ref() {
+        if let Some(output_ctx) = self.device_contexts[slot].as_ref() {
             self.flush_struct::<DeviceContextArray>(output_ctx.as_ref(), FlushType::Invalidate);
             // Clone slot context from Output -> Input
             *input_ctx.get_slot_mut() = output_ctx.get_slot().clone();
@@ -449,9 +476,9 @@ impl<'a> Xhci<'a> {
             self.flush_struct::<DeviceContextBaseAddressArray>(self.device_context_baa.as_ref().unwrap(), FlushType::Clean);
         }
 
-        self.create_slot_context(&mut input_ctx, port, speed, max_packet_size);
-        self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
-                                0, EP_TYPE_CONTROL_BIDIR, max_packet_size,
+        self.create_slot_context(&mut input_ctx, port_ctx);
+        self.configure_endpoint(slot as u8, input_ctx.as_mut(),
+                                0, EP_TYPE_CONTROL_BIDIR, port_ctx.max_packet_size,
                                 0, 0);
 
         input_ctx.get_input_mut()[1] = 0b11;
@@ -572,11 +599,6 @@ impl<'a> Xhci<'a> {
                         debug!("Transfer Complete: status = {:?}", code);
                         if t.status.get_code() != TRBCompletionCode::ShortPacket as u8 {
                             if !matches!(code, TRBCompletionCode::Success) {
-                                {
-                                    let mut lock = self.transfer_rings.get(&(slot_id, 0)).as_ref().unwrap().lock();
-                                    lock.push_group(trbs.as_slice());
-                                }
-
                                 return Err(Error::Completion(code));
                             }
                         } else {
@@ -756,7 +778,7 @@ impl<'a> Xhci<'a> {
 
         self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_mut_slice(&mut hub_descriptor))[..4])?;
 
-        let length = hub_descriptor.length as usize;
+        let length = hub_descriptor.bLength as usize;
         self.fetch_class_descriptor(slot_id, desc_type, 0, 0, &mut (as_mut_slice(&mut hub_descriptor))[..length])?;
 
         Ok(hub_descriptor)
@@ -856,7 +878,7 @@ impl<'a> Xhci<'a> {
         self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_CONFIGURATION, 0, 0, &mut config_descriptor)?;
         let config: USBConfigurationDescriptor = unsafe { core::mem::transmute(config_descriptor) };
         let mut buf2: Vec<u8> = Vec::new();
-        buf2.resize(config.get_total_length() as usize, 0);
+        buf2.resize(config.wTotalLength as usize, 0);
         self.fetch_descriptor(slot_id, DESCRIPTOR_TYPE_CONFIGURATION, 0, 0, &mut buf2)?;
         let mut current_index = core::mem::size_of::<USBConfigurationDescriptor>();
         let mut interfaces: Vec<USBInterfaceDescriptorSet> = Default::default();
@@ -911,8 +933,8 @@ impl<'a> Xhci<'a> {
                 0
             }
             _ => {
-                let maxp_mult = (epdesc.max_packet_size >> 11) & 0x3;
-                maxp_mult as u32 * epdesc.max_packet_size as u32
+                let maxp_mult = (epdesc.wMaxPacketSize >> 11) & 0x3;
+                maxp_mult as u32 * epdesc.wMaxPacketSize as u32
             }
         }
     }
@@ -1031,320 +1053,320 @@ impl<'a> Xhci<'a> {
     }
 
     fn setup_new_device(&mut self, port: &mut Port) -> Result<u8, Error> {
-        self.reset_port(&port)?;
-        let slot = self.send_slot_enable()? as usize;
-        port.slot_id = slot as u8;
-        info!("Got slot id: {}", slot);
-
-        // Ok(slot as u8)
-
-        let speed = self.get_speed(&port)?;
-        let max_packet_size = match speed {
-            0 => {
-                error!("[XHCI] unknown device speed on port {}", port.port_id);
-                64
-            }
-            OP_PORT_STATUS_SPEED_LOW => 8,
-            OP_PORT_STATUS_SPEED_FULL |
-            OP_PORT_STATUS_SPEED_HIGH => 64,
-            _ => 512,
-        };
-
-        if speed == OP_PORT_STATUS_SPEED_LOW || speed == OP_PORT_STATUS_SPEED_FULL {
-            port.is_low_or_full_speed = true;
-        }
-
-        assert_ne!(slot, 0, "invalid slot 0 received");
-        self.setup_slot(&port, speed, max_packet_size, true);
-        debug!("Slot Setup -> max_packet_size: {}", max_packet_size);
-        let mut buf = [0u8; 8];
-        self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_DEVICE,
-                              0, 0, &mut buf)?;
-
-        debug!("First descriptor: {:?}", &buf);
-
-        let max_packet_size = match buf[7] {
-            8 => 8,
-            16 => 16,
-            32 => 32,
-            64 => 64,
-            9 => 512,
-            _ => panic!("Invalid maxPacketSize = {}", buf[7])
-        };
-        self.setup_slot(&port, speed, max_packet_size, false);
-        let desc = self.fetch_device_descriptor(port.slot_id)?;
-        debug!("Device Descriptor: {:#?}", desc);
-
-        let configuration = self.fetch_configuration_descriptor(port.slot_id)?;
-        debug!("configuration: {:#?}", configuration);
-
-        assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Standard, Device)), 0x00u8);
-        self.send_control_command(port.slot_id, request_type!(HostToDevice, Standard, Device), REQUEST_SET_CONFIGURATION, configuration.config.config_val as u16, 0, 0, None, None)?;
-        debug!("Applied Config {}", configuration.config.config_val);
-        self.hal.sleep(Duration::from_millis(10));
-
-        // Fetching language is removed due to various issues and most OS doesn't do it.
-        // let mut buf = [0u8; 2];
-        // self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
-        //                       0, 0, &mut buf)?;
-        // assert_eq!(buf[1], DESCRIPTOR_TYPE_STRING, "Descriptor is not STRING");
-        // assert!(buf[0] >= 4, "has language");
-        // let mut buf2: Vec<u8> = Vec::new();
-        // buf2.resize(buf[0] as usize, 0);
-        // self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
-        //                       0, 0, &mut buf2)?;
-        // let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
+        // self.reset_port(&port)?;
+        // let slot = self.send_slot_enable()? as usize;
+        // port.slot_id = slot as u8;
+        // info!("Got slot id: {}", slot);
         //
-        // debug!("Language code: {:#x}", lang);
-
-        // Display things
-        let mfg = self.fetch_string_descriptor(port.slot_id, desc.manufacturer_index, 0x409).unwrap_or(String::from("(no manufacturer name)"));
-        let prd = self.fetch_string_descriptor(port.slot_id, desc.product_index, 0x409).unwrap_or(String::from("(no product name)"));
-        let serial = self.fetch_string_descriptor(port.slot_id, desc.serial_index, 0x409).unwrap_or(String::from("(no serial number)"));
-        debug!("[XHCI] New device:\n  MFG: {}\n  Prd:{}\n  Serial:{}", mfg, prd, serial);
-
-        for interface in &configuration.ifsets {
-            if interface.interface.alt_set != 0 {
-                debug!("Skipping non-default altSetting Interface");
-                continue;
-            }
-            match interface.interface.class {
-                CLASS_CODE_MASS => {
-                    if interface.interface.sub_class != 0x6 {
-                        debug!("Skipping MSD with sub-class other than 0x6 (Transparent SCSI)");
-                        continue;
-                    }
-
-                    if interface.interface.protocol != 0x50 {
-                        debug!("Skipping MSD with protocol other than bulk-only");
-                        continue;
-                    }
-
-                    if interface.endpoints.len() < 2 {
-                        warn!("MSD has not enough endpoints!");
-                        continue;
-                    }
-
-                    let mut input_ring: Option<(u8, u8)> = None;
-                    let mut output_ring: Option<(u8, u8)> = None;
-
-                    self.with_input_context(port, |this, input_ctx| {
-                        for endpoint in interface.endpoints.iter() {
-                            if endpoint.attr != EP_ATTR_BULK {
-                                continue;
-                            }
-
-                            let typ = if Self::is_ep_input(endpoint.address) { EP_TYPE_BULK_IN } else { EP_TYPE_BULK_OUT };
-
-                            let ring = this.configure_endpoint(port.slot_id, input_ctx,
-                                                               endpoint.address,
-                                                               typ, endpoint.max_packet_size,
-                                                               endpoint.interval, this.get_max_esti_payload(endpoint));
-
-                            if Self::is_ep_input(endpoint.address) {
-                                input_ring = Some(ring);
-                            } else {
-                                output_ring = Some(ring);
-                            }
-                        }
-
-                        input_ctx.set_configure_ep_meta(configuration.config.config_val,
-                                                        interface.interface.interface_number, interface.interface.alt_set);
-
-                        Ok(())
-                    })?;
-
-                    let input_ring = input_ring.ok_or(Error::Str("MSD has no bulk input endpoint"))?;
-                    let output_ring = output_ring.ok_or(Error::Str("MSD has no bulk output endpoint"))?;
-
-                    debug!("MSD endpoints initialized with bulk_in:{:?} bulk_out:{:?}", input_ring, output_ring);
-
-                    let mut buf: Vec<u8> = Vec::new();
-                    buf.resize(31, 0);
-
-                    let t = [0x55, 0x53, 0x42, 0x43, 0x13, 0x37, 0x04, 0x20, 0x24, 0x00, 0x00, 0x00, 0x80, 0x00, 6, 0x12, 0x00, 0x00, 0x00, 0x24, 0x00];
-                    (&mut buf[..t.len()]).copy_from_slice(&t);
-
-                    let r = self.transfer_bulk_ring(output_ring, TransferBuffer::Write(buf.as_ref()));
-                    info!("Transfer Result: {:?}", r);
-
-                    let mut buf: Vec<u8> = Vec::new();
-                    buf.resize(36, 0);
-
-                    let r = self.transfer_bulk_ring(input_ring, TransferBuffer::Read(buf.as_mut()));
-                    info!("Transfer Result: {:?}", r);
-                    info!("Got: {:x?}", buf.as_slice());
-
-                    let mut buf: Vec<u8> = Vec::new();
-                    buf.resize(13, 0);
-
-                    let r = self.transfer_bulk_ring(input_ring, TransferBuffer::Read(buf.as_mut()));
-                    info!("Transfer Result: {:?}", r);
-                    info!("Got: {:x?}", buf.as_slice());
-
-                    self.hal.sleep(Duration::from_secs(5));
-                }
-                CLASS_CODE_HID => {
-                    if interface.interface.sub_class != 1 {
-                        debug!("Skipping non bios-mode HID device");
-                        continue;
-                    }
-
-                    if interface.interface.protocol != 1 {
-                        debug!("Skipping non keyboard");
-                        continue;
-                    }
-
-                    if interface.endpoints.len() == 0 {
-                        warn!("keyboard with no endpoints!");
-                        continue;
-                    }
-
-
-                    // Enable keyboard
-
-                    self.with_input_context(port, |_this, input_ctx| {
-
-                        // self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
-                        //                         interface.endpoints[0].address,
-                        //                         EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
-                        //                         interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
-
-
-                        input_ctx.set_configure_ep_meta(configuration.config.config_val,
-                                                        interface.interface.interface_number, interface.interface.alt_set);
-
-                        Ok(())
-                    })?;
-
-                    debug!("done keyboard configure endpoint");
-
-                    self.hal.sleep(Duration::from_millis(100));
-
-                    debug!("set hid idle");
-                    self.set_hid_idle(port.slot_id)?;
-
-                    // 0 is Boot Protocol
-                    debug!("set hid protocol");
-                    self.set_hid_protocol(port.slot_id, 0)?;
-
-                    // self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
-                    // debug!("Applied Config {}", configuration.config.config_val);
-
-
-                    let index = self.get_epctx_index(interface.endpoints[0].address);
-
-                    // for i in 0..10 {
-                    //     // debug!("set hid report");
-                    //     // match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
-                    //     //     Ok(_) => {
-                    //     //         info!("set_hid success");
-                    //     //     }
-                    //     //     Err(e) => {
-                    //     //         warn!("set_hid: failed to read: {:?}", e);
-                    //     //     }
-                    //     // }
-                    //
-                    //     debug!("fetch hid report");
-                    //     let mut buf = Box::new([0u8; 128]);
-                    //     match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, &mut buf[0..8]) {
-                    //         Ok(_) => {
-                    //             info!("got response: {:?}", &buf[0..8]);
-                    //         }
-                    //         Err(e) => {
-                    //             warn!("failed to read: {:?}", e);
-                    //         }
-                    //     }
-                    //
-                    //     self.hal.sleep(Duration::from_millis(500));
-                    // }
-                }
-                CLASS_CODE_HUB => {
-                    if interface.endpoints.len() == 0 {
-                        warn!("Hub with no endpoints!");
-                        continue;
-                    }
-                    if interface.endpoints.len() > 1 {
-                        warn!("Hub with more than 1 endpoint!");
-                        continue;
-                    }
-
-                    let hub_descriptor = self.fetch_hub_descriptor(port.slot_id, &desc)?;
-                    info!("Hub Descriptor: {:?}", hub_descriptor);
-
-                    // // Get Status
-                    // let mut buf = [0u8; 2];
-                    // self.send_control_command(port.slot_id,
-                    //                           0x80,
-                    //                           0x0, // Get Status
-                    //                           0x0, 0x0,
-                    //                           2, None, Some(&mut buf),
-                    // )?;
-                    // debug!("Status Read back: {:?}", buf);
-
-                    // Setup EPs
-                    debug!("Found {} eps on this interface", interface.endpoints.len());
-
-
-                    // Reconfigure to hub
-                    {
-                        self.with_input_context(port, |_this, input_ctx| {
-                            let mut slot_ctx = input_ctx.get_slot_mut();
-                            slot_ctx.dword1.set_hub(true);
-                            slot_ctx.numbr_ports = hub_descriptor.num_ports;
-                            slot_ctx.slot_state = 0;
-
-                            slot_ctx.interrupter_ttt = 0;
-
-                            Ok(())
-                        })?;
-
-                        self.with_input_context(port, |this, input_ctx| {
-                            this.configure_endpoint(port.slot_id, input_ctx,
-                                                    interface.endpoints[0].address,
-                                                    EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
-                                                    interface.endpoints[0].interval, this.get_max_esti_payload(&interface.endpoints[0]));
-
-                            input_ctx.set_configure_ep_meta(configuration.config.config_val,
-                                                            interface.interface.interface_number, interface.interface.alt_set);
-
-                            Ok(())
-                        })?;
-                    }
-
-                    debug!("slot state = {}", self.device_contexts[port.slot_id as usize - 1].as_ref().unwrap().get_slot().slot_state);
-
-                    let hub_descriptor = self.fetch_hub_descriptor(port.slot_id, &desc)?;
-                    info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
-
-
-                    for num in 1..=hub_descriptor.num_ports {
-                        self.set_feature(port.slot_id, num, FEATURE_PORT_POWER)?;
-
-                        self.hal.sleep(Duration::from_millis(hub_descriptor.potpgt as u64 * 2));
-
-                        self.clear_feature(port.slot_id, num, FEATURE_C_PORT_CONNECTION)?;
-
-                        let status = self.fetch_port_status(slot as u8, num)?;
-
-                        debug!("Port {}: status={:?}", num, status);
-
-                        if !status.get_device_connected() {
-                            continue;
-                        }
-
-                        let mut child_port = port.child_port(num);
-                        match self.setup_new_device(&mut child_port) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!("Failed to configure child of port {}: {:?}", port.port_id, e);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        // // Ok(slot as u8)
+        //
+        // let speed = self.get_speed(&port)?;
+        // let max_packet_size = match speed {
+        //     0 => {
+        //         error!("[XHCI] unknown device speed on port {}", port.port_id);
+        //         64
+        //     }
+        //     OP_PORT_STATUS_SPEED_LOW => 8,
+        //     OP_PORT_STATUS_SPEED_FULL |
+        //     OP_PORT_STATUS_SPEED_HIGH => 64,
+        //     _ => 512,
+        // };
+        //
+        // if speed == OP_PORT_STATUS_SPEED_LOW || speed == OP_PORT_STATUS_SPEED_FULL {
+        //     port.is_low_or_full_speed = true;
+        // }
+        //
+        // assert_ne!(slot, 0, "invalid slot 0 received");
+        // self.setup_slot(port.slot_id, speed, max_packet_size, true);
+        // debug!("Slot Setup -> max_packet_size: {}", max_packet_size);
+        // let mut buf = [0u8; 8];
+        // self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_DEVICE,
+        //                       0, 0, &mut buf)?;
+        //
+        // debug!("First descriptor: {:?}", &buf);
+        //
+        // let max_packet_size = match buf[7] {
+        //     8 => 8,
+        //     16 => 16,
+        //     32 => 32,
+        //     64 => 64,
+        //     9 => 512,
+        //     _ => panic!("Invalid maxPacketSize = {}", buf[7])
+        // };
+        // self.setup_slot(port.slot_id, speed, max_packet_size, false);
+        // let desc = self.fetch_device_descriptor(port.slot_id)?;
+        // debug!("Device Descriptor: {:#?}", desc);
+        //
+        // let configuration = self.fetch_configuration_descriptor(port.slot_id)?;
+        // debug!("configuration: {:#?}", configuration);
+        //
+        // assert_eq!(Into::<u8>::into(request_type!(HostToDevice, Standard, Device)), 0x00u8);
+        // self.send_control_command(port.slot_id, request_type!(HostToDevice, Standard, Device), REQUEST_SET_CONFIGURATION, configuration.config.bConfigurationValue as u16, 0, 0, None, None)?;
+        // debug!("Applied Config {}", configuration.config.bConfigurationValue);
+        // self.hal.sleep(Duration::from_millis(10));
+        //
+        // // Fetching language is removed due to various issues and most OS doesn't do it.
+        // // let mut buf = [0u8; 2];
+        // // self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
+        // //                       0, 0, &mut buf)?;
+        // // assert_eq!(buf[1], DESCRIPTOR_TYPE_STRING, "Descriptor is not STRING");
+        // // assert!(buf[0] >= 4, "has language");
+        // // let mut buf2: Vec<u8> = Vec::new();
+        // // buf2.resize(buf[0] as usize, 0);
+        // // self.fetch_descriptor(port.slot_id, DESCRIPTOR_TYPE_STRING,
+        // //                       0, 0, &mut buf2)?;
+        // // let lang = buf2[2] as u16 | ((buf2[3] as u16) << 8);
+        // //
+        // // debug!("Language code: {:#x}", lang);
+        //
+        // // Display things
+        // let mfg = self.fetch_string_descriptor(port.slot_id, desc.iManufacturer, 0x409).unwrap_or(String::from("(no manufacturer name)"));
+        // let prd = self.fetch_string_descriptor(port.slot_id, desc.iProduct, 0x409).unwrap_or(String::from("(no product name)"));
+        // let serial = self.fetch_string_descriptor(port.slot_id, desc.iSerialNumber, 0x409).unwrap_or(String::from("(no serial number)"));
+        // debug!("[XHCI] New device:\n  MFG: {}\n  Prd:{}\n  Serial:{}", mfg, prd, serial);
+        //
+        // for interface in &configuration.ifsets {
+        //     if interface.interface.bAlternateSetting != 0 {
+        //         debug!("Skipping non-default altSetting Interface");
+        //         continue;
+        //     }
+        //     match interface.interface.bInterfaceClass {
+        //         CLASS_CODE_MASS => {
+        //             if interface.interface.bInterfaceSubClass != 0x6 {
+        //                 debug!("Skipping MSD with sub-class other than 0x6 (Transparent SCSI)");
+        //                 continue;
+        //             }
+        //
+        //             if interface.interface.bInterfaceProtocol != 0x50 {
+        //                 debug!("Skipping MSD with protocol other than bulk-only");
+        //                 continue;
+        //             }
+        //
+        //             if interface.endpoints.len() < 2 {
+        //                 warn!("MSD has not enough endpoints!");
+        //                 continue;
+        //             }
+        //
+        //             let mut input_ring: Option<(u8, u8)> = None;
+        //             let mut output_ring: Option<(u8, u8)> = None;
+        //
+        //             self.with_input_context(port, |this, input_ctx| {
+        //                 for endpoint in interface.endpoints.iter() {
+        //                     if endpoint.bmAttributes != EP_ATTR_BULK {
+        //                         continue;
+        //                     }
+        //
+        //                     let typ = if Self::is_ep_input(endpoint.bEndpointAddress) { EP_TYPE_BULK_IN } else { EP_TYPE_BULK_OUT };
+        //
+        //                     let ring = this.configure_endpoint(port.slot_id, input_ctx,
+        //                                                        endpoint.bEndpointAddress,
+        //                                                        typ, endpoint.wMaxPacketSize,
+        //                                                        endpoint.bInterval, this.get_max_esti_payload(endpoint));
+        //
+        //                     if Self::is_ep_input(endpoint.bEndpointAddress) {
+        //                         input_ring = Some(ring);
+        //                     } else {
+        //                         output_ring = Some(ring);
+        //                     }
+        //                 }
+        //
+        //                 input_ctx.set_configure_ep_meta(configuration.config.bConfigurationValue,
+        //                                                 interface.interface.bInterfaceNumber, interface.interface.bAlternateSetting);
+        //
+        //                 Ok(())
+        //             })?;
+        //
+        //             let input_ring = input_ring.ok_or(Error::Str("MSD has no bulk input endpoint"))?;
+        //             let output_ring = output_ring.ok_or(Error::Str("MSD has no bulk output endpoint"))?;
+        //
+        //             debug!("MSD endpoints initialized with bulk_in:{:?} bulk_out:{:?}", input_ring, output_ring);
+        //
+        //             let mut buf: Vec<u8> = Vec::new();
+        //             buf.resize(31, 0);
+        //
+        //             let t = [0x55, 0x53, 0x42, 0x43, 0x13, 0x37, 0x04, 0x20, 0x24, 0x00, 0x00, 0x00, 0x80, 0x00, 6, 0x12, 0x00, 0x00, 0x00, 0x24, 0x00];
+        //             (&mut buf[..t.len()]).copy_from_slice(&t);
+        //
+        //             let r = self.transfer_bulk_ring(output_ring, TransferBuffer::Write(buf.as_ref()));
+        //             info!("Transfer Result: {:?}", r);
+        //
+        //             let mut buf: Vec<u8> = Vec::new();
+        //             buf.resize(36, 0);
+        //
+        //             let r = self.transfer_bulk_ring(input_ring, TransferBuffer::Read(buf.as_mut()));
+        //             info!("Transfer Result: {:?}", r);
+        //             info!("Got: {:x?}", buf.as_slice());
+        //
+        //             let mut buf: Vec<u8> = Vec::new();
+        //             buf.resize(13, 0);
+        //
+        //             let r = self.transfer_bulk_ring(input_ring, TransferBuffer::Read(buf.as_mut()));
+        //             info!("Transfer Result: {:?}", r);
+        //             info!("Got: {:x?}", buf.as_slice());
+        //
+        //             self.hal.sleep(Duration::from_secs(5));
+        //         }
+        //         CLASS_CODE_HID => {
+        //             if interface.interface.bInterfaceSubClass != 1 {
+        //                 debug!("Skipping non bios-mode HID device");
+        //                 continue;
+        //             }
+        //
+        //             if interface.interface.bInterfaceProtocol != 1 {
+        //                 debug!("Skipping non keyboard");
+        //                 continue;
+        //             }
+        //
+        //             if interface.endpoints.len() == 0 {
+        //                 warn!("keyboard with no endpoints!");
+        //                 continue;
+        //             }
+        //
+        //
+        //             // Enable keyboard
+        //
+        //             self.with_input_context(port, |_this, input_ctx| {
+        //
+        //                 // self.configure_endpoint(port.slot_id, input_ctx.as_mut(),
+        //                 //                         interface.endpoints[0].address,
+        //                 //                         EP_TYPE_INTERRUPT_IN, interface.endpoints[0].max_packet_size,
+        //                 //                         interface.endpoints[0].interval, self.get_max_esti_payload(&interface.endpoints[0]));
+        //
+        //
+        //                 input_ctx.set_configure_ep_meta(configuration.config.bConfigurationValue,
+        //                                                 interface.interface.bInterfaceNumber, interface.interface.bAlternateSetting);
+        //
+        //                 Ok(())
+        //             })?;
+        //
+        //             debug!("done keyboard configure endpoint");
+        //
+        //             self.hal.sleep(Duration::from_millis(100));
+        //
+        //             debug!("set hid idle");
+        //             self.set_hid_idle(port.slot_id)?;
+        //
+        //             // 0 is Boot Protocol
+        //             debug!("set hid protocol");
+        //             self.set_hid_protocol(port.slot_id, 0)?;
+        //
+        //             // self.send_control_command(port.slot_id, 0x0, REQUEST_SET_CONFIGURATION, 1, 0, 0, None, None)?;
+        //             // debug!("Applied Config {}", configuration.config.config_val);
+        //
+        //
+        //             let index = self.get_epctx_index(interface.endpoints[0].bEndpointAddress);
+        //
+        //             // for i in 0..10 {
+        //             //     // debug!("set hid report");
+        //             //     // match self.set_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, if i % 2 == 0 { 0 } else { 0xFF }) {
+        //             //     //     Ok(_) => {
+        //             //     //         info!("set_hid success");
+        //             //     //     }
+        //             //     //     Err(e) => {
+        //             //     //         warn!("set_hid: failed to read: {:?}", e);
+        //             //     //     }
+        //             //     // }
+        //             //
+        //             //     debug!("fetch hid report");
+        //             //     let mut buf = Box::new([0u8; 128]);
+        //             //     match self.fetch_hid_report(port.slot_id, 1, 0, interface.interface.interface_number as u16, &mut buf[0..8]) {
+        //             //         Ok(_) => {
+        //             //             info!("got response: {:?}", &buf[0..8]);
+        //             //         }
+        //             //         Err(e) => {
+        //             //             warn!("failed to read: {:?}", e);
+        //             //         }
+        //             //     }
+        //             //
+        //             //     self.hal.sleep(Duration::from_millis(500));
+        //             // }
+        //         }
+        //         CLASS_CODE_HUB => {
+        //             if interface.endpoints.len() == 0 {
+        //                 warn!("Hub with no endpoints!");
+        //                 continue;
+        //             }
+        //             if interface.endpoints.len() > 1 {
+        //                 warn!("Hub with more than 1 endpoint!");
+        //                 continue;
+        //             }
+        //
+        //             let hub_descriptor = self.fetch_hub_descriptor(port.slot_id, &desc)?;
+        //             info!("Hub Descriptor: {:?}", hub_descriptor);
+        //
+        //             // // Get Status
+        //             // let mut buf = [0u8; 2];
+        //             // self.send_control_command(port.slot_id,
+        //             //                           0x80,
+        //             //                           0x0, // Get Status
+        //             //                           0x0, 0x0,
+        //             //                           2, None, Some(&mut buf),
+        //             // )?;
+        //             // debug!("Status Read back: {:?}", buf);
+        //
+        //             // Setup EPs
+        //             debug!("Found {} eps on this interface", interface.endpoints.len());
+        //
+        //
+        //             // Reconfigure to hub
+        //             {
+        //                 self.with_input_context(port, |_this, input_ctx| {
+        //                     let mut slot_ctx = input_ctx.get_slot_mut();
+        //                     slot_ctx.dword1.set_hub(true);
+        //                     slot_ctx.numbr_ports = hub_descriptor.bNbrPorts;
+        //                     slot_ctx.slot_state = 0;
+        //
+        //                     slot_ctx.interrupter_ttt = 0;
+        //
+        //                     Ok(())
+        //                 })?;
+        //
+        //                 self.with_input_context(port, |this, input_ctx| {
+        //                     this.configure_endpoint(port.slot_id, input_ctx,
+        //                                             interface.endpoints[0].bEndpointAddress,
+        //                                             EP_TYPE_INTERRUPT_IN, interface.endpoints[0].wMaxPacketSize,
+        //                                             interface.endpoints[0].bInterval, this.get_max_esti_payload(&interface.endpoints[0]));
+        //
+        //                     input_ctx.set_configure_ep_meta(configuration.config.bConfigurationValue,
+        //                                                     interface.interface.bInterfaceNumber, interface.interface.bAlternateSetting);
+        //
+        //                     Ok(())
+        //                 })?;
+        //             }
+        //
+        //             debug!("slot state = {}", self.device_contexts[port.slot_id as usize - 1].as_ref().unwrap().get_slot().slot_state);
+        //
+        //             let hub_descriptor = self.fetch_hub_descriptor(port.slot_id, &desc)?;
+        //             info!("Hub Descriptor Pt2: {:?}", hub_descriptor);
+        //
+        //
+        //             for num in 1..=hub_descriptor.bNbrPorts {
+        //                 self.set_feature(port.slot_id, num, FEATURE_PORT_POWER)?;
+        //
+        //                 self.hal.sleep(Duration::from_millis(hub_descriptor.bPwrOn2PwrGood as u64 * 2));
+        //
+        //                 self.clear_feature(port.slot_id, num, FEATURE_C_PORT_CONNECTION)?;
+        //
+        //                 let status = self.fetch_port_status(slot as u8, num)?;
+        //
+        //                 debug!("Port {}: status={:?}", num, status);
+        //
+        //                 if !status.get_device_connected() {
+        //                     continue;
+        //                 }
+        //
+        //                 let mut child_port = port.child_port(num);
+        //                 match self.setup_new_device(&mut child_port) {
+        //                     Ok(_) => {}
+        //                     Err(e) => {
+        //                         error!("Failed to configure child of port {}: {:?}", port.port_id, e);
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //         _ => {}
+        //     }
+        // }
 
         // let usb_dev = Arc::new(USBXHCIDevice {
         //     // Device
@@ -1391,7 +1413,7 @@ impl<'a> Xhci<'a> {
         // // debug!("MAX LUN: {}", lun);
         // // GET MAX LUN END
         // debug!("[XHCI] Completed setup port {} on slot {}", port_id, slot);
-        return Ok(slot as u8);
+        return Ok(0 as u8);
     }
 
     pub fn do_stuff(&mut self) -> Result<(), Error> {
@@ -1446,7 +1468,7 @@ impl<'a> Xhci<'a> {
         debug!("[XHCI] Controller with version {:04x}", ver);
 
         self.send_nop();
-        self.poll_ports();
+        // self.poll_ports();
         let crcr = self.op.command_ring_control.read();
         info!("current crcr: {:#x}", crcr);
 
@@ -1592,6 +1614,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
+    #[track_caller]
     fn wait_command_complete(&mut self, ptr: u64) -> Option<CommandCompletionTRB> {
         self.hal.memory_barrier();
         // TODO update this code to use interrupt notification system
@@ -1630,7 +1653,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn is_port_connected(&self, port_id: u8) -> bool {
+    fn is_hub_port_connected(&self, port_id: u8) -> bool {
         let port_op = self.op.get_port_operational_register(port_id);
         let mut port_status = port_op.portsc.read();
         if port_status & OP_PORT_STATUS_POWER_MASK == 0 {
@@ -1652,7 +1675,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn poll_port_status(&mut self, port_id: u8) {
-        let ready = self.is_port_connected(port_id);
+        let ready = self.is_hub_port_connected(port_id);
 
         info!("Port {}: connected={}", port_id, ready);
         if ready {
@@ -1711,7 +1734,6 @@ impl<'a> Xhci<'a> {
     }
 
     fn handle_root_hub_command(&mut self, command: ControlCommand) -> Result<(), Error> {
-
         /*
 
 
@@ -1732,18 +1754,28 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
 
         match (command.request_type, command.request) {
             (request_type!(HostToDevice, Class, Other), REQUEST_SET_FEATURE) => {
-                assert_eq!(command.value, FEATURE_PORT_RESET as u16);
-                self.op.get_port_operational_register(port).portsc.update(|tmp| {
-                    *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
-                    *tmp |= OP_PORT_STATUS_RESET_MASK | OP_PORT_STATUS_PRC_MASK;
-                });
+                match command.value as u8 {
+                    FEATURE_PORT_POWER => {},
+                    FEATURE_PORT_RESET => {
+                        self.op.get_port_operational_register(port).portsc.update(|tmp| {
+                            *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
+                            *tmp |= OP_PORT_STATUS_RESET_MASK | OP_PORT_STATUS_PRC_MASK;
+                        });
+                    }
+                    c => panic!("unexpected SET_FEATURE: {}", c),
+                }
             }
             (request_type!(HostToDevice, Class, Other), REQUEST_CLEAR_FEATURE) => {
-                assert_eq!(command.value, FEATURE_C_PORT_RESET as u16);
-                self.op.get_port_operational_register(port).portsc.update(|tmp| {
-                    *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
-                    *tmp |= OP_PORT_STATUS_PRC_MASK;
-                });
+                match command.value as u8 {
+                    FEATURE_C_PORT_CONNECTION => {},
+                    FEATURE_C_PORT_RESET => {
+                        self.op.get_port_operational_register(port).portsc.update(|tmp| {
+                            *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
+                            *tmp |= OP_PORT_STATUS_PRC_MASK;
+                        });
+                    }
+                    c => panic!("unexpected REQUEST_CLEAR_FEATURE: {}", c),
+                }
             }
             (request_type!(DeviceToHost, Class, Other), REQUEST_GET_STATUS) => {
                 let mut status = PortStatus::default();
@@ -1753,12 +1785,91 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
                     status.set_change_reset(true);
                 }
 
-                if let TransferBuffer::Read(slice) = command.buffer {
-                    copy_from_slice(slice, as_slice(&status));
-                } else {
-                    panic!("got a {:?} buffer on a REQUEST_GET_STATUS command", command.buffer);
+                if self.is_hub_port_connected(port) {
+                    status.set_device_connected(true);
                 }
 
+                respond_slice(command, as_slice(&status));
+            }
+            (request_type!(DeviceToHost, Standard, Device), REQUEST_GET_DESCRIPTOR) => {
+                let (desc_type, desc_index) = ((command.value >> 8) as u8, command.value as u8);
+
+                match desc_type {
+                    DESCRIPTOR_TYPE_DEVICE => {
+
+                        let mut desc = USBDeviceDescriptor::default();
+                        desc.bLength = 18;
+                        desc.bDescriptorType = DESCRIPTOR_TYPE_DEVICE;
+                        desc.bcdUSB = 512;
+                        desc.bDeviceClass = 9;
+                        desc.bDeviceSubClass = 0;
+                        desc.bDeviceProtocol = 1;
+                        desc.bMaxPacketSize = 9;
+                        desc.idVendor = 0x1337;
+                        desc.idProduct = 0xcafe;
+                        desc.bcdDevice = 256;
+                        desc.bNumConfigurations = 1;
+
+                        respond_slice(command, as_slice(&desc));
+                    }
+                    DESCRIPTOR_TYPE_CONFIGURATION => {
+                        assert_eq!(core::mem::size_of::<USBConfigurationDescriptor>(), 9);
+
+                        let total_length = core::mem::size_of::<USBConfigurationDescriptor>() + core::mem::size_of::<USBInterfaceDescriptor>();
+
+                        let mut desc = USBConfigurationDescriptor::default();
+                        desc.bLength = 9;
+                        desc.bDescriptorType = DESCRIPTOR_TYPE_CONFIGURATION;
+                        desc.wTotalLength = total_length as u16;
+                        desc.bNumInterface = 1;
+                        desc.bConfigurationValue = 1;
+
+                        let mut interface = USBInterfaceDescriptor::default();
+                        interface.bLength = 9;
+                        interface.bDescriptorType = DESCRIPTOR_TYPE_INTERFACE;
+                        interface.bInterfaceNumber = 1;
+                        interface.bAlternateSetting = 0;
+                        interface.bNumEndpoints = 0;
+                        interface.bInterfaceClass = 9;
+                        interface.bInterfaceSubClass = 0;
+                        interface.bInterfaceProtocol = 1;
+                        interface.iInterface = 0;
+
+                        #[repr(C, packed)]
+                        struct FullDescriptor(USBConfigurationDescriptor, USBInterfaceDescriptor);
+                        assert_eq!(core::mem::size_of::<FullDescriptor>(), total_length);
+
+                        respond_slice(command, as_slice(&FullDescriptor(desc, interface)));
+                    }
+                    DESCRIPTOR_TYPE_STRING => {
+                        panic!("string? what is string?");
+                    }
+                    desc => {
+                        panic!("got read for unknown descriptor {} on command {:?}", desc, command);
+                    }
+                }
+            }
+            (request_type!(DeviceToHost, Class, Device), REQUEST_GET_DESCRIPTOR) => {
+                let (desc_type, desc_index) = ((command.value >> 8) as u8, command.value as u8);
+
+                match desc_type {
+                    DESCRIPTOR_TYPE_HUB => {
+
+                        let mut desc = USBHubDescriptor::default();
+                        desc.bLength = core::mem::size_of::<USBHubDescriptor>() as u8;
+                        desc.bDescriptorType = DESCRIPTOR_TYPE_HUB;
+                        desc.bNbrPorts = self.info.max_port;
+                        desc.wHubCharacteristics = 1; // TODO what should this be
+
+                        respond_slice(command, as_slice(&desc));
+                    }
+                    desc => {
+                        panic!("got read for unknown class descriptor {} on command {:?}", desc, command);
+                    }
+                }
+            }
+            (request_type!(HostToDevice, Standard, Device), REQUEST_SET_CONFIGURATION) => {
+                // TODO not no-op? assertions?
             }
             _ => {
                 panic!("got unknown command for hub: {:?}", command);
@@ -1785,12 +1896,26 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
     }
 }
 
+fn speed_to_xhci(speed: USBSpeed) -> u8 {
+    match speed {
+        USBSpeed::Low => OP_PORT_STATUS_SPEED_LOW,
+        USBSpeed::Full => OP_PORT_STATUS_SPEED_FULL,
+        USBSpeed::High => OP_PORT_STATUS_SPEED_HIGH,
+        USBSpeed::Super => OP_PORT_STATUS_SPEED_SUPER_G1,
+        c => panic!("unknown speed: {:?}", c),
+    }
+}
+
 pub struct XhciWrapper(pub Mutex<Xhci<'static>>);
 
 struct USBDeviceMeta {
     pub is_root_hub: bool,
     pub slot: u8,
-    pub port: Port,
+
+    pub root_port: u8,
+    pub parent_slot: u8,
+    pub route_string: u32,
+    pub parent_is_low_or_full_speed: bool,
 }
 
 impl USBMeta for USBDeviceMeta {}
@@ -1801,7 +1926,10 @@ impl USBHostController for XhciWrapper {
         device.prv = Some(Box::new(USBDeviceMeta {
             is_root_hub: true,
             slot: 0,
-            port: Port::new_from_root(0), // fake port
+            root_port: 0,
+            parent_slot: 0,
+            route_string: 0,
+            parent_is_low_or_full_speed: false,
         }));
     }
 
@@ -1810,7 +1938,7 @@ impl USBHostController for XhciWrapper {
 
         let endpoint_type = match endpoint {
             None => EndpointType::Control,
-            Some(d) => match d.descriptor_type {
+            Some(d) => match d.bDescriptorType {
                 0 => EndpointType::Control,
                 1 => EndpointType::Isochronous,
                 2 => EndpointType::Bulk,
@@ -1819,49 +1947,108 @@ impl USBHostController for XhciWrapper {
             }
         };
 
+        if dev_lock.prv.is_none() {
+            let slot = dev_lock.addr as u8;
+            assert_ne!(slot, 0);
+            dev_lock.prv.replace(Box::new(USBDeviceMeta {
+                is_root_hub: false,
+                slot,
+                root_port: 0,
+                parent_slot: 0,
+                route_string: 0,
+                parent_is_low_or_full_speed: false,
+            }));
+        }
+
         let f = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
             assert!(matches!(endpoint, None));
             return Ok(Arc::new(RwLock::new(USBPipe { index: 0, endpoint_type: EndpointType::Control })));
         }
 
+        assert_ne!(dev_lock.addr, 0);
+
         match endpoint_type {
             EndpointType::Control => {
-
                 let mut x = self.0.lock();
 
-                let slot = x.send_slot_enable().unwrap() as usize;
+                let slot = dev_lock.addr as u8;
 
-                let (speed, max_packet_size) = (dev_lock.speed, dev_lock.max_packet_size);
-                assert_ne!(speed, 0);
+                let (speed, max_packet_size) = (dev_lock.speed, dev_lock.ddesc.get_max_packet_size() as u16);
+                assert_ne!(speed, USBSpeed::Invalid);
                 assert_ne!(max_packet_size, 0);
 
+                let mut parent_slot: u8;
+                let mut route_string: u32;
+                let mut parent_is_low_or_full_speed: bool;
+                let mut root_port: u8;
+
+                {
+                    let parent = dev_lock.parent.as_ref().expect("non-root hub has no parent");
+                    let par_lock = parent.read();
+                    let f = par_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+
+                    if f.is_root_hub {
+                        parent_slot = 0;
+                        route_string = 0;
+                        parent_is_low_or_full_speed = false;
+                        root_port = dev_lock.port;
+                    } else {
+                        parent_slot = par_lock.addr as u8;
+                        route_string = f.route_string | (par_lock.port as u32) << (4 * (par_lock.depth - 1));
+                        parent_is_low_or_full_speed = par_lock.speed.is_low_or_full_speed();
+                        root_port = f.root_port;
+                    }
+                }
+
                 let mut f = dev_lock.prv.as_mut().unwrap().downcast_mut::<USBDeviceMeta>().unwrap();
-                f.port.slot_id = slot as u8;
-                f.slot = slot as u8;
 
-                x.setup_slot(&f.port, speed, max_packet_size, true);
+                f.parent_slot = parent_slot;
+                f.route_string = route_string;
+                f.parent_is_low_or_full_speed = parent_is_low_or_full_speed;
+                f.root_port = root_port;
 
-            },
-            EndpointType::Isochronous => {},
-            EndpointType::Bulk => {},
-            EndpointType::Interrupt => {},
+                let ctx = PortContext {
+                    port: dev_lock.port,
+                    parent_slot,
+                    route_string,
+                    parent_is_low_or_full_speed,
+                    speed: dev_lock.speed,
+                    root_port,
+                    max_packet_size: dev_lock.ddesc.get_max_packet_size() as u16,
+                };
+
+                x.setup_slot(slot, &ctx, true);
+            }
+            EndpointType::Isochronous => {}
+            EndpointType::Bulk => {}
+            EndpointType::Interrupt => {}
         }
 
         Err(usb_host::items::Error::Str("bad"))
     }
 
-    fn set_address(&self, device: &Arc<RwLock<USBDevice>>) {
-
-        let device = device.write();
-        let f = device.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+    fn set_address(&self, device: &Arc<RwLock<USBDevice>>, addr: u32) {
+        let dev_lock = device.read();
+        let f = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
             return;
         }
 
-        let mut x = self.0.lock();
-        x.setup_slot(&f.port, device.speed, device.max_packet_size, false);
+        let ctx = PortContext {
+            port: dev_lock.port,
+            parent_slot: f.parent_slot,
+            route_string: f.route_string,
+            parent_is_low_or_full_speed: f.parent_is_low_or_full_speed,
+            speed: dev_lock.speed,
+            root_port: f.root_port,
+            max_packet_size: dev_lock.ddesc.get_max_packet_size() as u16,
+        };
 
+        let mut x = self.0.lock();
+        x.setup_slot(addr as u8, &ctx, false);
+
+        let dev_lock = device.write();
     }
 
     fn control_transfer(&self, device: &Arc<RwLock<USBDevice>>, endpoint: &USBPipe, command: ControlCommand) {
@@ -1879,15 +2066,25 @@ impl USBHostController for XhciWrapper {
 
         let mut x = self.0.lock();
         let result = match command.buffer {
-            TransferBuffer::Read(slice) => x.send_control_command(meta.port.slot_id, command.request_type, command.request, command.value, command.index, command.length, None, Some(slice)),
-            TransferBuffer::Write(slice) => x.send_control_command(meta.port.slot_id, command.request_type, command.request, command.value, command.index, command.length, Some(slice), None),
-            TransferBuffer::None => x.send_control_command(meta.port.slot_id, command.request_type, command.request, command.value, command.index, command.length, None, None),
+            TransferBuffer::Read(slice) => x.send_control_command(meta.slot, command.request_type, command.request, command.value, command.index, command.length, None, Some(slice)),
+            TransferBuffer::Write(slice) => x.send_control_command(meta.slot, command.request_type, command.request, command.value, command.index, command.length, Some(slice), None),
+            TransferBuffer::None => x.send_control_command(meta.slot, command.request_type, command.request, command.value, command.index, command.length, None, None),
         };
 
         if let Err(e) = result {
             panic!("control_command error: {:?}", e);
         }
     }
+
+    fn allocate_slot(&self) -> u8 {
+        let mut x = self.0.lock();
+        x.send_slot_enable().unwrap_or_else(|e| panic!("failed to allocate slot: {:?}", e))
+    }
+
+    fn free_slot(&self, slot: u8) {
+        debug!("free_slot(): leaking slot={}", slot);
+    }
+
 }
 
 #[repr(C)]
