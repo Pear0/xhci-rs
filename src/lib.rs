@@ -4,7 +4,7 @@
 #![feature(llvm_asm)]
 #![feature(track_caller)]
 
-#![allow(dead_code, unused_imports, unused_parens)]
+#![allow(dead_code, unused_imports, unused_parens, unused_variables)]
 
 #![cfg_attr(not(test), no_std)]
 
@@ -32,6 +32,7 @@ use volatile::*;
 
 use usb_host::consts::USBSpeed;
 use usb_host::descriptor::*;
+use usb_host::error::USBError;
 use usb_host::items::{ControlCommand, EndpointType, Port, TransferBuffer, TypeTriple};
 use usb_host::items::TransferDirection::HostToDevice;
 use usb_host::structs::{PortStatus, USBDevice};
@@ -153,7 +154,7 @@ pub enum FlushType {
     CleanAndInvalidate,
 }
 
-pub trait HAL {
+pub trait HAL : Send + Sync {
     fn current_time(&self) -> Duration;
     fn sleep(&self, dur: Duration);
     fn memory_barrier(&self);
@@ -463,7 +464,7 @@ impl<'a> Xhci<'a> {
             // Clone CtrlEP0
             *input_ctx.get_endpoint_mut(0) = output_ctx.get_endpoint(0).clone();
         } else {
-            let mut dev_ctx = Box::new(if self.info.big_context { DeviceContextArray::new_big() } else { DeviceContextArray::new_normal() });
+            let dev_ctx = Box::new(if self.info.big_context { DeviceContextArray::new_big() } else { DeviceContextArray::new_normal() });
             let ctx_ptr = self.get_ptr::<DeviceContextArray>(dev_ctx.as_ref());
 
             self.flush_struct::<DeviceContextArray>(dev_ctx.as_ref(), FlushType::Clean);
@@ -1869,7 +1870,7 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
                         desc.bLength = core::mem::size_of::<USBHubDescriptor>() as u8;
                         desc.bDescriptorType = DESCRIPTOR_TYPE_HUB;
                         desc.bNbrPorts = self.info.max_port;
-                        desc.wHubCharacteristics = 1; // TODO what should this be
+                        desc.wHubCharacteristics = USBHubDescriptorHubCharacteristics::default();
 
                         respond_slice(command, as_slice(&desc));
                     }
@@ -1994,10 +1995,10 @@ impl USBHostController for XhciWrapper {
                 assert_ne!(speed, USBSpeed::Invalid);
                 assert_ne!(max_packet_size, 0);
 
-                let mut parent_slot: u8;
-                let mut route_string: u32;
-                let mut parent_is_low_or_full_speed: bool;
-                let mut root_port: u8;
+                let parent_slot: u8;
+                let route_string: u32;
+                let parent_is_low_or_full_speed: bool;
+                let root_port: u8;
 
                 {
                     let parent = dev_lock.parent.as_ref().expect("non-root hub has no parent");
@@ -2115,6 +2116,51 @@ impl USBHostController for XhciWrapper {
 
         let mut x = self.0.lock();
         x.setup_slot(addr as u8, &ctx, false);
+    }
+
+    fn configure_hub(&self, device: &Arc<RwLock<USBDevice>>, nbr_ports: u8, ttt: u8) -> Result<(), USBError> {
+
+        // Nothing needs to be done for a root hub, since it is "fake"
+        if device.read().parent.is_none() {
+            return Ok(());
+        }
+
+        let slot = device.read().addr as u8;
+        let mut x = self.0.lock();
+        let mut input_ctx = Box::new(if x.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
+
+        let ctx = x.device_contexts[(slot - 1) as usize].as_ref().expect("No context for slot");
+        x.hal.flush_cache(ctx.get_ptr_va(), ctx.get_size() as u64, FlushType::Invalidate);
+
+        *input_ctx.get_slot_mut() = ctx.get_slot().clone();
+        let slot_ctx = input_ctx.get_slot_mut();
+        slot_ctx.numbr_ports = nbr_ports;
+        slot_ctx.interrupter_ttt = ttt as u16;
+        slot_ctx.dword1.set_hub(true);
+
+        // update slot context
+        input_ctx.get_input_mut()[1] = 0b1;
+
+        x.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+        let input_ctx_ptr = x.hal.translate_addr(input_ctx.get_ptr_va());
+
+        let ptr = x.command_ring.as_mut().expect("").push(
+            TRB { command: CommandTRB::configure_endpoint(slot, input_ctx_ptr) }
+        );
+        return match x.wait_command_complete(ptr) {
+            Some(trb) => {
+                if trb.code == TRBCompletionCode::Success as u8 {
+                    Ok(())
+                } else {
+                    let code = TRBCompletionCode::from(trb.code);
+                    warn!("TRB Completion with non-success code: {:?} -> {:?}", code, trb);
+                    Err(USBError::InvalidState)
+                }
+            }
+            None => {
+                Err(USBError::Timeout)
+            }
+        };
     }
 
     fn control_transfer(&self, endpoint: &USBPipe, command: ControlCommand) {
