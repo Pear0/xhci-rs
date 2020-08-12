@@ -1757,6 +1757,7 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
                 match command.value as u8 {
                     FEATURE_PORT_POWER => {},
                     FEATURE_PORT_RESET => {
+                        debug!("root hub reset port {}", port);
                         self.op.get_port_operational_register(port).portsc.update(|tmp| {
                             *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
                             *tmp |= OP_PORT_STATUS_RESET_MASK | OP_PORT_STATUS_PRC_MASK;
@@ -1769,6 +1770,7 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
                 match command.value as u8 {
                     FEATURE_C_PORT_CONNECTION => {},
                     FEATURE_C_PORT_RESET => {
+                        debug!("root hub clear port did reset {}", port);
                         self.op.get_port_operational_register(port).portsc.update(|tmp| {
                             *tmp &= !OP_PORT_STATUS_PED_MASK; // Mask off this bit, writing a 1 will disable device
                             *tmp |= OP_PORT_STATUS_PRC_MASK;
@@ -1787,6 +1789,16 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
 
                 if self.is_hub_port_connected(port) {
                     status.set_device_connected(true);
+
+                    let portsc = self.op.get_port_operational_register(port).portsc.read();
+                    match ((portsc & OP_PORT_STATUS_SPEED_MASK) >> OP_PORT_STATUS_SPEED_SHIFT) as u8 {
+                        OP_PORT_STATUS_SPEED_LOW => status.set_low_speed(true),
+                        OP_PORT_STATUS_SPEED_HIGH => status.set_high_speed(true),
+                        OP_PORT_STATUS_SPEED_FULL => {},
+                        c => {
+                            panic!("Unknown speed: {}", c)
+                        },
+                    }
                 }
 
                 respond_slice(command, as_slice(&status));
@@ -2047,8 +2059,6 @@ impl USBHostController for XhciWrapper {
 
         let mut x = self.0.lock();
         x.setup_slot(addr as u8, &ctx, false);
-
-        let dev_lock = device.write();
     }
 
     fn control_transfer(&self, device: &Arc<RwLock<USBDevice>>, endpoint: &USBPipe, command: ControlCommand) {
