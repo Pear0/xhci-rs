@@ -30,10 +30,11 @@ use hashbrown::HashMap;
 use spin::{Mutex, RwLock};
 use volatile::*;
 
+use usb_host::consts::USBSpeed;
 use usb_host::descriptor::*;
 use usb_host::items::{ControlCommand, EndpointType, Port, TransferBuffer, TypeTriple};
 use usb_host::items::TransferDirection::HostToDevice;
-use usb_host::structs::{USBDevice, PortStatus};
+use usb_host::structs::{PortStatus, USBDevice};
 use usb_host::traits::{USBHostController, USBMeta, USBPipe};
 
 use crate::consts::*;
@@ -43,7 +44,6 @@ use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, ScratchPadBufferArray, SlotContext, XHCIRing, XHCIRingSegment};
 use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TransferEventTRB, TRB, TRBType};
 use crate::trb::TRBType::TransferEvent;
-use usb_host::consts::USBSpeed;
 
 pub mod quirks;
 #[macro_use]
@@ -380,7 +380,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn get_epctx_index(&self, endpoint_address: u8) -> u8 {
+    fn get_epctx_index(endpoint_address: u8) -> u8 {
         let is_in = Self::is_ep_input(endpoint_address);
         if endpoint_address == 0 {
             0
@@ -401,7 +401,7 @@ impl<'a> Xhci<'a> {
         assert_eq!(transfer_ring_ptr & 0b1111, 0, "alignment");
         trace!("[XHCI] Setting Transfer Ring Pointer to {:#x}", transfer_ring_ptr);
 
-        let index = self.get_epctx_index(endpoint_address);
+        let index = Self::get_epctx_index(endpoint_address);
 
         // TODO: Rethink populate max_entries field
         let current_entries = input_ctx.get_slot_mut().dword1.get_context_entries();
@@ -447,7 +447,6 @@ impl<'a> Xhci<'a> {
                 input_ctx.get_slot_mut().parent_port_number = port_ctx.port;
             }
         }
-
     }
 
     fn setup_slot(&mut self, slot: u8, port_ctx: &PortContext, block_cmd: bool) -> Box<InputContext> {
@@ -926,7 +925,7 @@ impl<'a> Xhci<'a> {
         Ok(USBConfigurationDescriptorSet { config, ifsets: interfaces })
     }
 
-    fn get_max_esti_payload(&self, epdesc: &USBEndpointDescriptor) -> u32 {
+    fn get_max_esti_payload(epdesc: &USBEndpointDescriptor) -> u32 {
         match epdesc.transfer_type() {
             USBEndpointTransferType::Control |
             USBEndpointTransferType::Bulk => {
@@ -939,10 +938,10 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn with_input_context<R, F: FnOnce(&mut Self, &mut InputContext) -> Result<R, Error>>(&mut self, port: &Port, func: F) -> Result<R, Error> {
+    fn with_input_context<R, F: FnOnce(&mut Self, &mut InputContext) -> Result<R, Error>>(&mut self, slot: u8, func: F) -> Result<R, Error> {
         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
 
-        let ctx = self.device_contexts[(port.slot_id - 1) as usize].as_ref().expect("No context for slot");
+        let ctx = self.device_contexts[(slot - 1) as usize].as_ref().expect("No context for slot");
         self.hal.flush_cache(ctx.get_ptr_va(), ctx.get_size() as u64, FlushType::Invalidate);
 
         *input_ctx.get_slot_mut() = ctx.get_slot().clone();
@@ -960,7 +959,7 @@ impl<'a> Xhci<'a> {
         let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
 
         let ptr = self.command_ring.as_mut().expect("").push(
-            TRB { command: CommandTRB::configure_endpoint(port.slot_id, input_ctx_ptr) }
+            TRB { command: CommandTRB::configure_endpoint(slot, input_ctx_ptr) }
         );
         self.wait_command_complete(ptr).ok_or(Error::Str("command did not complete"))?;
         Ok(result)
@@ -1033,15 +1032,16 @@ impl<'a> Xhci<'a> {
         Ok(amount_transferred)
     }
 
-    fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> Result<(), Error> {
+    fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> Result<usize, Error> {
+        let original_length = transfer.len();
         loop {
             if transfer.len() == 0 {
-                return Ok(());
+                return Ok(original_length);
             }
 
             let amount = self.transfer_single_bulk_ring(ring, transfer.clone_mut())?;
             if amount == 0 {
-                return Err(Error::Str("transferred zero bytes, giving up"));
+                return Ok(original_length - transfer.len());
             }
 
             transfer = match transfer {
@@ -1755,7 +1755,7 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
         match (command.request_type, command.request) {
             (request_type!(HostToDevice, Class, Other), REQUEST_SET_FEATURE) => {
                 match command.value as u8 {
-                    FEATURE_PORT_POWER => {},
+                    FEATURE_PORT_POWER => {}
                     FEATURE_PORT_RESET => {
                         debug!("root hub reset port {}", port);
                         self.op.get_port_operational_register(port).portsc.update(|tmp| {
@@ -1768,7 +1768,7 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
             }
             (request_type!(HostToDevice, Class, Other), REQUEST_CLEAR_FEATURE) => {
                 match command.value as u8 {
-                    FEATURE_C_PORT_CONNECTION => {},
+                    FEATURE_C_PORT_CONNECTION => {}
                     FEATURE_C_PORT_RESET => {
                         debug!("root hub clear port did reset {}", port);
                         self.op.get_port_operational_register(port).portsc.update(|tmp| {
@@ -1794,10 +1794,10 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
                     match ((portsc & OP_PORT_STATUS_SPEED_MASK) >> OP_PORT_STATUS_SPEED_SHIFT) as u8 {
                         OP_PORT_STATUS_SPEED_LOW => status.set_low_speed(true),
                         OP_PORT_STATUS_SPEED_HIGH => status.set_high_speed(true),
-                        OP_PORT_STATUS_SPEED_FULL => {},
+                        OP_PORT_STATUS_SPEED_FULL => {}
                         c => {
                             warn!("Unknown speed: {}", c)
-                        },
+                        }
                     }
                 }
 
@@ -1808,7 +1808,6 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
 
                 match desc_type {
                     DESCRIPTOR_TYPE_DEVICE => {
-
                         let mut desc = USBDeviceDescriptor::default();
                         desc.bLength = 18;
                         desc.bDescriptorType = DESCRIPTOR_TYPE_DEVICE;
@@ -1866,7 +1865,6 @@ fn fetch_port_status(&mut self, slot_id: u8, port_id: u8) -> Result<PortStatus, 
 
                 match desc_type {
                     DESCRIPTOR_TYPE_HUB => {
-
                         let mut desc = USBHubDescriptor::default();
                         desc.bLength = core::mem::size_of::<USBHubDescriptor>() as u8;
                         desc.bDescriptorType = DESCRIPTOR_TYPE_HUB;
@@ -1946,42 +1944,48 @@ impl USBHostController for XhciWrapper {
     }
 
     fn pipe_open(&self, device: &Arc<RwLock<USBDevice>>, endpoint: Option<&USBEndpointDescriptor>) -> Result<Arc<RwLock<USBPipe>>, usb_host::items::Error> {
-        let mut dev_lock = device.write();
-
-        let endpoint_type = match endpoint {
-            None => EndpointType::Control,
-            Some(d) => match d.bDescriptorType {
-                0 => EndpointType::Control,
-                1 => EndpointType::Isochronous,
-                2 => EndpointType::Bulk,
-                3 => EndpointType::Interrupt,
-                d => panic!("bad descriptor_type: {}", d),
+        if endpoint.is_none() {
+            let mut dev_lock = device.write();
+            if dev_lock.prv.is_none() {
+                let slot = dev_lock.addr as u8;
+                assert_ne!(slot, 0);
+                dev_lock.prv.replace(Box::new(USBDeviceMeta {
+                    is_root_hub: false,
+                    slot,
+                    root_port: 0,
+                    parent_slot: 0,
+                    route_string: 0,
+                    parent_is_low_or_full_speed: false,
+                }));
             }
-        };
-
-        if dev_lock.prv.is_none() {
-            let slot = dev_lock.addr as u8;
-            assert_ne!(slot, 0);
-            dev_lock.prv.replace(Box::new(USBDeviceMeta {
-                is_root_hub: false,
-                slot,
-                root_port: 0,
-                parent_slot: 0,
-                route_string: 0,
-                parent_is_low_or_full_speed: false,
-            }));
         }
+
+        let cloned_device = device.clone();
+        let mut dev_lock = device.upgradeable_read();
+
+        assert!(dev_lock.prv.is_some());
+
+        let cloned_controller = {
+            let bus_lock = dev_lock.bus.read();
+            bus_lock.controller.clone()
+        };
 
         let f = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
             assert!(matches!(endpoint, None));
-            return Ok(Arc::new(RwLock::new(USBPipe { index: 0, endpoint_type: EndpointType::Control })));
+            return Ok(Arc::new(RwLock::new(USBPipe {
+                device: cloned_device,
+                controller: cloned_controller,
+                index: 0,
+                endpoint_type: EndpointType::Control,
+                is_input: true,
+            })));
         }
 
         assert_ne!(dev_lock.addr, 0);
 
-        match endpoint_type {
-            EndpointType::Control => {
+        match endpoint {
+            None => {
                 let mut x = self.0.lock();
 
                 let slot = dev_lock.addr as u8;
@@ -2013,6 +2017,7 @@ impl USBHostController for XhciWrapper {
                     }
                 }
 
+                let mut dev_lock = dev_lock.upgrade();
                 let mut f = dev_lock.prv.as_mut().unwrap().downcast_mut::<USBDeviceMeta>().unwrap();
 
                 f.parent_slot = parent_slot;
@@ -2031,10 +2036,61 @@ impl USBHostController for XhciWrapper {
                 };
 
                 x.setup_slot(slot, &ctx, true);
+
+                return Ok(Arc::new(RwLock::new(USBPipe {
+                    device: cloned_device,
+                    controller: cloned_controller,
+                    index: 0,
+                    endpoint_type: EndpointType::Control,
+                    is_input: true,
+                })));
             }
-            EndpointType::Isochronous => {}
-            EndpointType::Bulk => {}
-            EndpointType::Interrupt => {}
+            Some(endpoint_desc) => {
+                let slot = dev_lock.addr as u8;
+
+                let endpoint_type = match endpoint_desc.bmAttributes & 0b11 {
+                    0 => EndpointType::Control,
+                    1 => EndpointType::Isochronous,
+                    2 => EndpointType::Bulk,
+                    3 => EndpointType::Interrupt,
+                    _ => panic!("unreachable"),
+                };
+
+                let endpoint_index = Xhci::get_epctx_index(endpoint_desc.bEndpointAddress);
+                let endpoint_is_input = Xhci::is_ep_input(endpoint_desc.bEndpointAddress);
+
+                let endpoint_type_value = match (&endpoint_type, endpoint_is_input) {
+                    (EndpointType::Control, _) => EP_TYPE_CONTROL_BIDIR,
+                    (EndpointType::Isochronous, true) => EP_TYPE_ISOCH_IN,
+                    (EndpointType::Isochronous, false) => EP_TYPE_ISOCH_OUT,
+                    (EndpointType::Bulk, true) => EP_TYPE_BULK_IN,
+                    (EndpointType::Bulk, false) => EP_TYPE_BULK_OUT,
+                    (EndpointType::Interrupt, true) => EP_TYPE_INTERRUPT_IN,
+                    (EndpointType::Interrupt, false) => EP_TYPE_INTERRUPT_OUT,
+                };
+
+                let mut x = self.0.lock();
+                x.with_input_context(slot, |this, input_ctx| {
+
+                    this.configure_endpoint(slot, input_ctx,
+                                            endpoint_desc.bEndpointAddress,
+                                            endpoint_type_value, endpoint_desc.wMaxPacketSize,
+                                            endpoint_desc.bInterval, Xhci::get_max_esti_payload(endpoint_desc));
+
+                    // input_ctx.set_configure_ep_meta(configuration.config.config_val,
+                    //                                 interface.interface.interface_number, interface.interface.alt_set);
+
+                    Ok(())
+                }).unwrap_or_else(|e| panic!("bigly oof: {:?}", e));
+
+                return Ok(Arc::new(RwLock::new(USBPipe {
+                    device: cloned_device,
+                    controller: cloned_controller,
+                    index: endpoint_index,
+                    endpoint_type,
+                    is_input: endpoint_is_input,
+                })));
+            }
         }
 
         Err(usb_host::items::Error::Str("bad"))
@@ -2061,9 +2117,9 @@ impl USBHostController for XhciWrapper {
         x.setup_slot(addr as u8, &ctx, false);
     }
 
-    fn control_transfer(&self, device: &Arc<RwLock<USBDevice>>, endpoint: &USBPipe, command: ControlCommand) {
+    fn control_transfer(&self, endpoint: &USBPipe, command: ControlCommand) {
         assert_eq!(endpoint.index, 0);
-        let dev_lock = device.read();
+        let dev_lock = endpoint.device.read();
 
         let meta = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if meta.is_root_hub {
@@ -2086,6 +2142,25 @@ impl USBHostController for XhciWrapper {
         }
     }
 
+    fn bulk_transfer(&self, endpoint: &USBPipe, buffer: TransferBuffer) -> Result<usize, usb_host::items::Error> {
+        assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk));
+
+        let dev_lock = endpoint.device.read();
+
+        let ring = (dev_lock.addr as u8, endpoint.index);
+
+        let mut x = self.0.lock();
+        x.transfer_bulk_ring(ring, buffer).map_err(|e| match e {
+            Error::Str(s) => usb_host::items::Error::Str(s),
+            Error::Completion(c) => {
+                use core::fmt::Write;
+                let err = Box::leak(Box::new(String::new()));
+                write!(err, "{:?}", c);
+                usb_host::items::Error::Str(err.as_str())
+            },
+        })
+    }
+
     fn allocate_slot(&self) -> u8 {
         let mut x = self.0.lock();
         x.send_slot_enable().unwrap_or_else(|e| panic!("failed to allocate slot: {:?}", e))
@@ -2094,7 +2169,6 @@ impl USBHostController for XhciWrapper {
     fn free_slot(&self, slot: u8) {
         debug!("free_slot(): leaking slot={}", slot);
     }
-
 }
 
 #[repr(C)]
