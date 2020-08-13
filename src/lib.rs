@@ -602,10 +602,6 @@ impl<'a> Xhci<'a> {
                 TRBType::TransferEvent(c) => {
                     if c.trb_pointer == ptr {
                         debug!("Got transfer event: {:?} -> bytes remain: {}", c, c.status.get_bytes_remain());
-                        let code = c.status.get_code();
-                        if code != 1 {
-                            panic!("EHHHH WTF: {:?}", TRBCompletionCode::from(code));
-                        }
                         return Some(c);
                     } else {
                         debug!("trb_pointer badddddd: {:?}", c);
@@ -618,7 +614,7 @@ impl<'a> Xhci<'a> {
         }
     }
 
-    fn transfer_single_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> USBResult<usize> {
+    fn transfer_single_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> USBResult<(usize, bool)> {
         debug!("transfer_single_bulk_ring(ring:{:?}, transfer:{:?})", ring, transfer);
         let mut my_read_buffer = Box::new([0u8; 512]);
 
@@ -647,6 +643,15 @@ impl<'a> Xhci<'a> {
         self.trigger_ring_doorbell(ring);
 
         let event = self.wait_for_transfer_event(ptr).ok_or(USBErrorKind::Timeout.msg("timed out waiting for transfer response"))?;
+        let code = TRBCompletionCode::from(event.status.get_code());
+        if !matches!(code, TRBCompletionCode::Success | TRBCompletionCode::ShortPacket) {
+            return Err(code.into());
+        }
+        if matches!(code, TRBCompletionCode::ShortPacket) {
+            warn!("got a short packet: {:?}", event);
+        }
+
+        let can_request_more = !matches!(code, TRBCompletionCode::ShortPacket);
         let amount_transferred = packet_size - event.status.get_bytes_remain() as usize;
 
         if let TransferBuffer::Read(slice) = &mut transfer {
@@ -654,7 +659,7 @@ impl<'a> Xhci<'a> {
             (&mut slice[..amount_transferred]).copy_from_slice(&my_buffer[..amount_transferred]);
         }
 
-        Ok(amount_transferred)
+        Ok((amount_transferred, can_request_more))
     }
 
     fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> USBResult<usize> {
@@ -664,9 +669,9 @@ impl<'a> Xhci<'a> {
                 return Ok(original_length);
             }
 
-            let amount = self.transfer_single_bulk_ring(ring, transfer.clone_mut())?;
-            if amount == 0 {
-                return Ok(original_length - transfer.len());
+            let (amount, has_more) = self.transfer_single_bulk_ring(ring, transfer.clone_mut())?;
+            if amount == 0 || !has_more {
+                return Ok((original_length - transfer.len()) + amount);
             }
 
             transfer = match transfer {
