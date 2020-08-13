@@ -2179,7 +2179,7 @@ impl USBHostController for XhciWrapper {
     }
 
     fn bulk_transfer(&self, endpoint: &USBPipe, buffer: TransferBuffer) -> Result<usize, usb_host::items::Error> {
-        assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk));
+        assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk | EndpointType::Interrupt));
 
         let dev_lock = endpoint.device.read();
 
