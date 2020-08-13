@@ -2,6 +2,8 @@
 
 use core::time::Duration;
 
+use usb_host::{USBError, USBErrorKind};
+
 /* ------ XHCI PCI Config Space ---------------- */
 pub const USB_INTEL_XUSB2PR: u8 = 0xD0;
 pub const USB_INTEL_USB2PRM: u8 = 0xD4;
@@ -126,11 +128,6 @@ pub const TRB_TYPE_EVNT_MFINDEX_WRAP: u16 = 39;
 pub const EVENT_RING_NUM_SEGMENTS: usize = 1;
 pub const TRBS_PER_SEGMENT: usize = 256;
 
-/* --------- TIMEOUT Constants ----------------- */
-pub const HALT_TIMEOUT: Duration = Duration::from_millis(16);
-pub const RESET_TIMEOUT: Duration = Duration::from_millis(250);
-pub const PORT_RESET_TIMEOUT: Duration = Duration::from_millis(1000);
-
 /* ------------- XHCI Slot Context -------------- */
 pub const SLOT_CTX_SPEED_SHIFT: u32 = 20;
 pub const SLOT_CTX_SPEED_MASK: u32 = 0xF << SLOT_CTX_SPEED_SHIFT;
@@ -145,20 +142,6 @@ pub const EP_CTX_EPTYPE_SHIFT: u8 = 3;
 pub const EP_CTX_EPTYPE_MASK: u8 = 0b111 << EP_CTX_EPTYPE_SHIFT;
 pub const EP_CTX_INTERVAL_SHIFT: u32 = 16;
 pub const EP_CTX_INTERVAL_MASK: u32 = 0xFF << EP_CTX_INTERVAL_SHIFT;
-
-pub const EP_ATTR_CONTROL: u8 = 0;
-pub const EP_ATTR_ISOCH: u8 = 1;
-pub const EP_ATTR_BULK: u8 = 2;
-pub const EP_ATTR_INTERRUPT: u8 = 3;
-
-pub const EP_TYPE_NOT_VALID: u8 = 0;
-pub const EP_TYPE_ISOCH_OUT: u8 = 1;
-pub const EP_TYPE_BULK_OUT: u8 = 2;
-pub const EP_TYPE_INTERRUPT_OUT: u8 = 3;
-pub const EP_TYPE_CONTROL_BIDIR: u8 = 4;
-pub const EP_TYPE_ISOCH_IN: u8 = 5;
-pub const EP_TYPE_BULK_IN: u8 = 6;
-pub const EP_TYPE_INTERRUPT_IN: u8 = 7;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -207,65 +190,57 @@ pub enum TRBCompletionCode {
 impl From<u8> for TRBCompletionCode {
     fn from(value: u8) -> Self {
         if value >= TRBCompletionCode::OtherReserved as u8 {
-            return TRBCompletionCode::OtherReserved
+            return TRBCompletionCode::OtherReserved;
         }
         unsafe { core::mem::transmute(value) }
     }
 }
 
-/* --------- Standard Requests ---------------- */
-pub const REQUEST_GET_STATUS: u8 = 0;
-pub const REQUEST_CLEAR_FEATURE: u8 = 1;
-pub const REQUEST_SET_FEATURE: u8 = 3;
-pub const REQUEST_SET_ADDRESS: u8 = 5;
-pub const REQUEST_GET_DESCRIPTOR: u8 = 6;
-pub const REQUEST_SET_DESCRIPTOR: u8 = 7;
-pub const REQUEST_GET_CONFIGURATION: u8 = 8;
-pub const REQUEST_SET_CONFIGURATION: u8 = 9;
-pub const REQUEST_GET_INTERFACE: u8 = 10;
-pub const REQUEST_SET_INTERFACE: u8 = 11;
+impl Into<USBError> for TRBCompletionCode {
+    fn into(self) -> USBError {
+        use TRBCompletionCode::*;
+        type Kind = USBErrorKind;
+        match self {
+            Invalid => Kind::Other.msg("TRB Code: Invalid"),
+            Success => Kind::Other.msg("TRB Code: Success"),
+            DataBufferErr => Kind::Other.msg("TRB Code: DataBufferErr"),
+            BabbleDetectedErr => Kind::Other.msg("TRB Code: BabbleDetectedErr"),
+            USBTransactionErr => Kind::Other.msg("TRB Code: USBTransactionErr"),
+            TRBErr => Kind::InvalidArgument.msg("TRB Code: TRBErr"),
+            StallErr => Kind::Timeout.msg("TRB Code: StallErr"),
+            ResourceErr => Kind::Other.msg("TRB Code: ResourceErr"),
+            BandwidthErr => Kind::Timeout.msg("TRB Code: BandwidthErr"),
+            NoSlotsErr => Kind::NoFreeDeviceAddress.msg("TRB Code: NoSlotsErr"),
+            InvalidStreamType => Kind::InvalidArgument.msg("TRB Code: InvalidStreamType"),
+            SlotNotEnabledErr => Kind::InvalidArgument.msg("TRB Code: SlotNotEnabledErr"),
+            EPNotEnabledErr => Kind::InvalidArgument.msg("TRB Code: EPNotEnabledErr"),
+            ShortPacket => Kind::Other.msg("TRB Code: ShortPacket"),
+            RingUnderrun => Kind::Other.msg("TRB Code: RingUnderrun"),
+            RingOverrun => Kind::Other.msg("TRB Code: RingOverrun"),
+            VFEventRingFullErr => Kind::Other.msg("TRB Code: VFEventRingFullErr"),
+            ParamErr => Kind::InvalidArgument.msg("TRB Code: ParamErr"),
+            BandwidthOverrun => Kind::Other.msg("TRB Code: BandwidthOverrun"),
+            ContextStateErr => Kind::Other.msg("TRB Code: ContextStateErr"),
+            NoPingResponseErr => Kind::Other.msg("TRB Code: NoPingResponseErr"),
+            EventRingFullErr => Kind::Other.msg("TRB Code: EventRingFullErr"),
+            IncompatibleDevice => Kind::Other.msg("TRB Code: IncompatibleDevice"),
+            MissedService => Kind::Other.msg("TRB Code: MissedService"),
+            CommandRingStoppedErr => Kind::Other.msg("TRB Code: CommandRingStoppedErr"),
+            CommandAborted => Kind::Other.msg("TRB Code: CommandAborted"),
+            Stopped => Kind::Other.msg("TRB Code: Stopped"),
+            StoppedLengthInvalid => Kind::Other.msg("TRB Code: StoppedLengthInvalid"),
+            StoppedShortPacket => Kind::Other.msg("TRB Code: StoppedShortPacket"),
+            MaxExitLatencyTooLarge => Kind::Other.msg("TRB Code: MaxExitLatencyTooLarge"),
+            Reserved => Kind::Other.msg("TRB Code: Reserved"),
+            IsochBufferOverrun => Kind::Other.msg("TRB Code: IsochBufferOverrun"),
+            EventLost => Kind::Other.msg("TRB Code: EventLost"),
+            UndefinedErr => Kind::Other.msg("TRB Code: UndefinedErr"),
+            InvalidStreamID => Kind::Other.msg("TRB Code: InvalidStreamID"),
+            SecondaryBandwidthErr => Kind::Other.msg("TRB Code: SecondaryBandwidthErr"),
+            SplitTransactionErr => Kind::Other.msg("TRB Code: SplitTransactionErr"),
+            OtherReserved => Kind::Other.msg("TRB Code: OtherReserved"),
+        }
+    }
+}
 
-// HID
-pub const REQUEST_GET_REPORT: u8 = 1;
-pub const REQUEST_SET_REPORT: u8 = 0x9;
-pub const REQUEST_SET_IDLE: u8 = 0xA;
-pub const REQUEST_SET_PROTOCOL: u8 = 0xB;
 
-/* Hub Requests */
-pub const REQUEST_CLEAR_TT_BUFFER: u8 = 8;
-pub const REQUEST_RESET_TT: u8 = 9;
-pub const REQUEST_RESET_TT_DEFAULT_TT: u16 = 1;
-pub const REQUEST_GET_TT_STATE: u8 = 10;
-pub const REQUEST_STOP_TT: u8 = 11;
-
-pub const DESCRIPTOR_TYPE_DEVICE: u8 = 1;
-pub const DESCRIPTOR_TYPE_CONFIGURATION: u8 = 2;
-pub const DESCRIPTOR_TYPE_STRING: u8 = 3;
-pub const DESCRIPTOR_TYPE_INTERFACE: u8 = 4;
-pub const DESCRIPTOR_TYPE_ENDPOINT: u8 = 5;
-pub const DESCRIPTOR_TYPE_DEVICE_QUALIFIER: u8 = 6;
-pub const DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION: u8 = 7;
-pub const DESCRIPTOR_TYPE_INTERFACE_POWER: u8 = 8;
-pub const DESCRIPTOR_TYPE_HUB: u8 = 0x29;
-pub const DESCRIPTOR_TYPE_SS_HUB: u8 = 0x2A;
-
-/* ---------- Class Codes ----------- */
-pub const CLASS_CODE_HID: u8 = 3;
-pub const CLASS_CODE_MASS: u8 = 8;
-pub const CLASS_CODE_HUB: u8 = 9;
-
-/* ---------- Feature Selector --------- */
-pub const FEATURE_PORT_CONNECTION: u8 = 0x00;
-pub const FEATURE_PORT_ENABLE: u8 = 0x01;
-pub const FEATURE_PORT_SUSPEND: u8 = 0x02;
-pub const FEATURE_PORT_OVER_CURRENT: u8 = 0x03;
-pub const FEATURE_PORT_RESET: u8 = 0x04;
-pub const FEATURE_PORT_POWER: u8 = 0x08;
-pub const FEATURE_PORT_LOW_SPEED: u8 = 0x09;
-pub const FEATURE_C_PORT_CONNECTION: u8 = 0x10;
-pub const FEATURE_C_PORT_ENABLE: u8 = 0x11;
-pub const FEATURE_C_PORT_SUSPEND: u8 = 0x12;
-pub const FEATURE_C_PORT_OVER_CURRENT: u8 = 0x13;
-pub const FEATURE_C_PORT_RESET: u8 = 0x14;
-pub const FEATURE_PORT_TEST: u8 = 0x15;
-pub const FEATURE_PORT_INDICATOR: u8 = 0x16;
