@@ -2,12 +2,13 @@ use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter};
+use core::marker::PhantomData;
 use core::ops::Deref;
 use core::ptr::NonNull;
 use modular_bitfield::prelude::*;
 
 use crate::consts::*;
-use crate::{HAL, FlushType};
+use crate::{XhciHAL, FlushType};
 use crate::trb::{LinkTRB, TRB};
 
 #[repr(C, align(2048))]
@@ -57,16 +58,16 @@ pub struct EventRingSegmentTable {
 }
 
 /* ----------------------- XHCI Ring ------------------------ */
-pub struct XHCIRing<'a> {
+pub struct XHCIRing<H: XhciHAL> {
     pub segments: Vec<Box<XHCIRingSegment>>,
     pub enqueue: (usize, usize),
     pub dequeue: (usize, usize),
     pub cycle_state: u32,
-    hal: &'a dyn HAL,
+    __phantom: PhantomData<H>,
 }
 
-impl<'a> XHCIRing<'a> {
-    pub fn new_with_capacity(hal: &'a dyn HAL, segments: usize, link_trbs: bool) -> XHCIRing {
+impl<H: XhciHAL> XHCIRing<H> {
+    pub fn new_with_capacity(segments: usize, link_trbs: bool) -> Self {
         let mut ring = XHCIRing {
             segments: Vec::new(),
             enqueue: (0, 0),
@@ -78,18 +79,18 @@ impl<'a> XHCIRing<'a> {
              * check ownership, so CCS = 1.
              */
             cycle_state: 1, // Ring is initialized to 0, thus cycle state = 1
-            hal,
+            __phantom: PhantomData::default(),
         };
         for idx in 0..segments {
 
             ring.segments.push(Box::new(XHCIRingSegment::default()));
             if link_trbs {
                 if idx > 0 {
-                    let ptr_pa = hal.translate_addr(ring.segments[idx].deref() as *const XHCIRingSegment as u64);
+                    let ptr_pa = H::translate_addr(ring.segments[idx].deref() as *const XHCIRingSegment as u64);
                     ring.segments[idx - 1].link_segment(ptr_pa);
                 }
                 if idx == segments - 1 {
-                    let ptr_pa = hal.translate_addr(ring.segments[0].deref() as *const XHCIRingSegment as u64);
+                    let ptr_pa = H::translate_addr(ring.segments[0].deref() as *const XHCIRingSegment as u64);
                     ring.segments[idx].link_segment(ptr_pa);
                     unsafe { ring.segments[idx].trbs[TRBS_PER_SEGMENT - 1].link.link_flags |= TRB_LINK_TOGGLE_MASK };
                 }
@@ -97,7 +98,7 @@ impl<'a> XHCIRing<'a> {
         }
 
         for seg in ring.segments.iter() {
-            hal.flush_cache(seg.as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
+            H::flush_cache(seg.as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
         }
 
         ring
@@ -120,7 +121,7 @@ impl<'a> XHCIRing<'a> {
         }
         self.segments[self.enqueue.0].trbs[self.enqueue.1] = trb;
         let ptr_va = &self.segments[self.enqueue.0].trbs[self.enqueue.1] as *const TRB as u64;
-        let ptr_pa = self.hal.translate_addr(ptr_va);
+        let ptr_pa = H::translate_addr(ptr_va);
         if self.enqueue.1 < (TRBS_PER_SEGMENT - 2) { // Last element is Link
             self.enqueue.1 += 1;
         } else {
@@ -135,7 +136,7 @@ impl<'a> XHCIRing<'a> {
             }
             self.enqueue.1 = 0;
         }
-        self.hal.flush_cache(ptr_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
+        H::flush_cache(ptr_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
         (ptr_va, ptr_pa)
     }
 
@@ -160,11 +161,11 @@ impl<'a> XHCIRing<'a> {
         let first = unsafe { &mut *(first_va as *mut TRB) };
         first.set_cycle_state(Self::swap_cycle(first.get_cycle_state()));
 
-        self.hal.flush_cache(first_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
+        H::flush_cache(first_va, core::mem::size_of::<TRB>() as u64, FlushType::Clean);
     }
 
     pub fn pop(&mut self, has_link: bool) -> Option<TRB> {
-        self.hal.flush_cache((&self.segments[self.dequeue.0].trbs[self.dequeue.1]) as *const TRB as u64, 16, FlushType::Invalidate);
+        H::flush_cache((&self.segments[self.dequeue.0].trbs[self.dequeue.1]) as *const TRB as u64, 16, FlushType::Invalidate);
         let trb = self.segments[self.dequeue.0].trbs[self.dequeue.1].clone();
         if trb.get_cycle_state() != self.cycle_state as u8 {
             return None;
@@ -184,11 +185,11 @@ impl<'a> XHCIRing<'a> {
     }
 
     pub fn dequeue_pointer(&self) -> u64 {
-        self.hal.translate_addr(&self.segments[self.dequeue.0].trbs[self.dequeue.1] as *const TRB as u64)
+        H::translate_addr(&self.segments[self.dequeue.0].trbs[self.dequeue.1] as *const TRB as u64)
     }
 }
 
-impl Debug for XHCIRing<'_> {
+impl<H: XhciHAL> Debug for XHCIRing<H> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(f, "XHCIRing {{ enq: {:?}, deq: {:?}, cycle_state: {}, num_segs: {} }}",
                self.enqueue, self.dequeue, self.cycle_state, self.segments.len())
@@ -440,7 +441,7 @@ pub struct ScratchPadBufferArray {
 }
 
 impl ScratchPadBufferArray {
-    pub fn new_with_capacity<'a>(hal: &'a dyn HAL, num: usize, page_size: usize) -> Self {
+    pub fn new_with_capacity<H: XhciHAL>(num: usize, page_size: usize) -> Self {
         assert!(num <= 1024, "unsupported count > 1024");
         let mut thing = Self {
             scratchpads: [0; 1024],
@@ -451,7 +452,7 @@ impl ScratchPadBufferArray {
             let ptr = Global.alloc(Layout::from_size_align(page_size, page_size).expect("alignment"),
                                    AllocInit::Zeroed).expect("alloc failed").ptr.as_ptr() as u64;
             thing.scratchpad_vas[i] = ptr;
-            thing.scratchpads[i] = hal.translate_addr(ptr);
+            thing.scratchpads[i] = H::translate_addr(ptr);
         }
         thing
     }

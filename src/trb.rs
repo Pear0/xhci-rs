@@ -3,7 +3,7 @@ use core::fmt::{Debug, Formatter};
 use modular_bitfield::prelude::*;
 
 use crate::consts::*;
-use crate::HAL;
+use crate::XhciHAL;
 
 /* --------------------------- TRBs --------------------------- */
 
@@ -269,10 +269,10 @@ pub struct NormalTRB {
 }
 
 impl NormalTRB {
-    pub fn new<'a>(hal: &'a dyn HAL, buf: &[u8], max_len: usize) -> Self {
+    pub fn new<H: XhciHAL>(buf: &[u8], max_len: usize) -> Self {
         // TODO Support max len
         assert!(buf.len() <= max_len, "exceed max len not supported");
-        let buf_ptr =  hal.translate_addr(buf.as_ptr() as u64);
+        let buf_ptr =  H::translate_addr(buf.as_ptr() as u64);
         let mut thing = Self {
             buffer: buf_ptr,
             int_len: Default::default(),

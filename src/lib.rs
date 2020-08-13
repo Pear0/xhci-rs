@@ -21,6 +21,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use core::ops::Deref;
 use core::ptr::NonNull;
 use core::time::Duration;
@@ -142,18 +143,16 @@ pub enum FlushType {
     CleanAndInvalidate,
 }
 
-pub trait HAL: Send + Sync {
-    fn current_time(&self) -> Duration;
-    fn sleep(&self, dur: Duration);
-    fn memory_barrier(&self);
-    fn translate_addr(&self, addr: u64) -> u64;
-    fn flush_cache(&self, addr: u64, len: u64, flush: FlushType);
+pub trait XhciHAL: usb_host::UsbHAL + Send + Sync {
+    fn memory_barrier();
+    fn translate_addr(addr: u64) -> u64;
+    fn flush_cache(addr: u64, len: u64, flush: FlushType);
 
-    fn alloc_noncached(&self, layout: Layout) -> Option<u64> {
+    fn alloc_noncached(layout: Layout) -> Option<u64> {
         Global.alloc(layout, AllocInit::Zeroed).ok().map(|x| x.ptr.as_ptr() as u64)
     }
 
-    fn free_noncached(&self, ptr: u64, layout: Layout) {
+    fn free_noncached(ptr: u64, layout: Layout) {
         unsafe {
             Global.dealloc(NonNull::new_unchecked(ptr as *mut u8), layout);
         }
@@ -171,23 +170,23 @@ struct PortContext {
     max_packet_size: u16,
 }
 
-pub struct Xhci<'a> {
+pub struct Xhci<H: XhciHAL> {
     mmio_virt_base: u64,
     cap: &'static mut XHCICapabilityRegisters,
     op: &'static mut XHCIOperationalRegisters,
-    hal: &'a dyn HAL,
     info: XHCIInfo,
     device_context_baa: Option<Box<DeviceContextBaseAddressArray>>,
     device_contexts: [Option<Box<DeviceContextArray>>; 255],
 
     // (slot, endpoint)
-    transfer_rings: HashMap<(u8, u8), Arc<Mutex<XHCIRing<'a>>>>,
+    transfer_rings: HashMap<(u8, u8), Arc<Mutex<XHCIRing<H>>>>,
 
-    command_ring: Option<XHCIRing<'a>>,
-    event_ring: Option<XHCIRing<'a>>,
+    command_ring: Option<XHCIRing<H>>,
+    event_ring: Option<XHCIRing<H>>,
     event_ring_table: Option<Box<EventRingSegmentTable>>,
     scratchpads: Option<Box<ScratchPadBufferArray>>,
     pub quirks: XHCIQuirks,
+    __phantom: PhantomData<H>,
 }
 
 #[derive(Default)]
@@ -202,8 +201,8 @@ pub struct XHCIInfo {
     runtime_offset: u32,
 }
 
-impl<'a> Xhci<'a> {
-    pub fn new(base_address: u64, hal: &'a dyn HAL) -> Self {
+impl<H: XhciHAL> Xhci<H> {
+    pub fn new(base_address: u64) -> Self {
         let cap = get_registers::<XHCICapabilityRegisters>(base_address);
         let cap_size = (cap.length_and_ver.read() & 0xFF) as u64;
 
@@ -220,7 +219,6 @@ impl<'a> Xhci<'a> {
             mmio_virt_base: base_address,
             cap,
             op: op_regs,
-            hal,
             info,
             device_context_baa: None,
             device_contexts: [None; 255],
@@ -230,6 +228,7 @@ impl<'a> Xhci<'a> {
             event_ring_table: None,
             scratchpads: None,
             quirks: Default::default(),
+            __phantom: PhantomData::default(),
         };
 
         this.do_stuff();
@@ -253,37 +252,37 @@ impl<'a> Xhci<'a> {
     }
 
     fn wait_until<E, F: Fn(&mut Self) -> bool>(&mut self, e: E, timeout: Duration, func: F) -> Result<(), E> {
-        let wait_limit = self.hal.current_time() + timeout;
+        let wait_limit = H::current_time() + timeout;
         loop {
             if func(self) {
                 return Ok(());
             }
-            if self.hal.current_time() > wait_limit {
+            if H::current_time() > wait_limit {
                 return Err(e);
             }
-            self.hal.sleep(Duration::from_millis(1));
+            H::sleep(Duration::from_millis(1));
         }
     }
 
     fn flush_trb(&self, ptr: u64, flush: FlushType) {
-        self.hal.flush_cache(ptr, 16, flush);
+        H::flush_cache(ptr, 16, flush);
     }
 
     fn flush_struct<T>(&self, val: &T, flush: FlushType) {
-        self.hal.flush_cache(val as *const T as u64, core::mem::size_of_val(val) as u64, flush);
+        H::flush_cache(val as *const T as u64, core::mem::size_of_val(val) as u64, flush);
     }
 
     fn flush_slice<T>(&self, val: &[T], flush: FlushType) {
-        self.hal.flush_cache(val.as_ptr() as u64, core::mem::size_of_val(val) as u64, flush);
+        H::flush_cache(val.as_ptr() as u64, core::mem::size_of_val(val) as u64, flush);
     }
 
     pub fn reset(&mut self) -> USBResult<()> {
         self.op.command.update(|x| *x |= OP_CMD_RESET_MASK);
-        self.hal.memory_barrier();
+        H::memory_barrier();
 
-        self.wait_until(USBErrorKind::Timeout.msg("did not reset"), RESET_TIMEOUT, |this| {
-            let cmd = this.op.command.read();
-            let sts = this.op.status.read();
+        H::wait_until(USBErrorKind::Timeout.msg("did not reset"), RESET_TIMEOUT, || {
+            let cmd = self.op.command.read();
+            let sts = self.op.status.read();
             (cmd & OP_CMD_RESET_MASK == 0) && (sts & OP_STS_CNR_MASK == 0)
         })?;
 
@@ -291,7 +290,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn get_ptr<T>(&self, t: &T) -> u64 {
-        self.hal.translate_addr(t as *const T as u64)
+        H::translate_addr(t as *const T as u64)
     }
 
     fn send_slot_enable(&mut self) -> USBResult<u8> {
@@ -322,7 +321,7 @@ impl<'a> Xhci<'a> {
     fn configure_endpoint(&mut self, slot_id: u8, input_ctx: &mut InputContext,
                           endpoint_address: u8, endpoint_type: u8, max_packet_size: u16,
                           interval: u8, esit_payload_size: u32) -> (u8, u8) {
-        let transfer_ring = XHCIRing::new_with_capacity(self.hal, 1, true);
+        let transfer_ring = XHCIRing::<H>::new_with_capacity(1, true);
         let transfer_ring_ptr = self.get_ptr::<XHCIRingSegment>(transfer_ring.segments[0].as_ref());
         assert_eq!(transfer_ring_ptr & 0b1111, 0, "alignment");
         trace!("[XHCI] Setting Transfer Ring Pointer to {:#x}", transfer_ring_ptr);
@@ -408,15 +407,15 @@ impl<'a> Xhci<'a> {
 
         input_ctx.get_input_mut()[1] = 0b11;
 
-        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+        H::flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
 
-        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+        let input_ctx_ptr = H::translate_addr(input_ctx.get_ptr_va());
         let ptr = self.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::address_device(slot as u8, input_ctx_ptr, block_cmd) }
         );
         self.wait_command_complete(ptr).expect("command_complete");
 
-        self.hal.sleep(Duration::from_millis(10));
+        H::sleep(Duration::from_millis(10));
 
         input_ctx
     }
@@ -467,9 +466,9 @@ impl<'a> Xhci<'a> {
             // Data TRB
             let mut data = DataStageTRB::default();
             data.buffer = if write_to_usb.is_some() {
-                self.hal.translate_addr(write_to_usb.as_ref().unwrap().as_ptr() as u64)
+                H::translate_addr(write_to_usb.as_ref().unwrap().as_ptr() as u64)
             } else {
-                self.hal.translate_addr(read_from_usb.as_ref().unwrap().as_ptr() as u64)
+                H::translate_addr(read_from_usb.as_ref().unwrap().as_ptr() as u64)
             };
             data.params.set_transfer_size(min_length as u32);
 
@@ -567,7 +566,7 @@ impl<'a> Xhci<'a> {
         let mut input_ctx = Box::new(if self.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
 
         let ctx = self.device_contexts[(slot - 1) as usize].as_ref().expect("No context for slot");
-        self.hal.flush_cache(ctx.get_ptr_va(), ctx.get_size() as u64, FlushType::Invalidate);
+        H::flush_cache(ctx.get_ptr_va(), ctx.get_size() as u64, FlushType::Invalidate);
 
         *input_ctx.get_slot_mut() = ctx.get_slot().clone();
         // 31 is not a typo
@@ -580,8 +579,8 @@ impl<'a> Xhci<'a> {
         // always update slot context
         input_ctx.get_input_mut()[1] |= 1;
 
-        self.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
-        let input_ctx_ptr = self.hal.translate_addr(input_ctx.get_ptr_va());
+        H::flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+        let input_ctx_ptr = H::translate_addr(input_ctx.get_ptr_va());
 
         let ptr = self.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::configure_endpoint(slot, input_ctx_ptr) }
@@ -595,7 +594,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn wait_for_transfer_event(&mut self, ptr: u64) -> Option<TransferEventTRB> {
-        self.hal.memory_barrier();
+        H::memory_barrier();
         loop {
             let trb = self.poll_event_ring_trb()?;
             match trb {
@@ -634,7 +633,7 @@ impl<'a> Xhci<'a> {
         let transfer_ring = self.transfer_rings.get(&ring).unwrap();
         let mut transfer_ring = transfer_ring.lock();
 
-        let normal = NormalTRB::new(self.hal, my_buffer.as_ref(), my_buffer.len());
+        let normal = NormalTRB::new::<H>(my_buffer.as_ref(), my_buffer.len());
 
         let ptr = transfer_ring.push(TRB { normal });
 
@@ -754,11 +753,11 @@ impl<'a> Xhci<'a> {
 
         // Step 2: Setup Command Ring (CRCR)
         if self.command_ring.is_none() {
-            self.command_ring = Some(XHCIRing::new_with_capacity(self.hal, 1, true));
+            self.command_ring = Some(XHCIRing::<H>::new_with_capacity(1, true));
         }
 
         for i in 0..EVENT_RING_NUM_SEGMENTS {
-            self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
+            H::flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
         }
 
         let crcr_pa = self.get_ptr::<XHCIRingSegment>(self.command_ring.as_ref().unwrap().segments[0].as_ref());
@@ -776,13 +775,13 @@ impl<'a> Xhci<'a> {
                 (crcr_pa & OP_CRCR_CRPTR_MASK) |
                 (cyc_state & OP_CRCR_CS_MASK);
 
-            self.hal.memory_barrier();
+            H::memory_barrier();
             self.op.command_ring_control.write(val64);
-            self.hal.memory_barrier();
+            H::memory_barrier();
             self.get_doorbell_register(0).reg.write(0);
-            self.hal.memory_barrier();
+            H::memory_barrier();
             for i in 0..EVENT_RING_NUM_SEGMENTS {
-                self.hal.flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
+                H::flush_cache(self.command_ring.as_ref().unwrap().segments[i].as_ref() as *const XHCIRingSegment as u64, core::mem::size_of::<XHCIRingSegment>() as u64, FlushType::Clean);
             }
 
             let crcr = self.op.command_ring_control.read();
@@ -792,7 +791,7 @@ impl<'a> Xhci<'a> {
         debug!("[XHCI] CRCR Setup complete");
 
         // Setup Event Ring
-        self.event_ring = Some(XHCIRing::new_with_capacity(self.hal, EVENT_RING_NUM_SEGMENTS, false));
+        self.event_ring = Some(XHCIRing::<H>::new_with_capacity(EVENT_RING_NUM_SEGMENTS, false));
         self.event_ring_table = Some(Box::new(EventRingSegmentTable::default()));
         self.event_ring_table.as_mut().unwrap().segment_count = EVENT_RING_NUM_SEGMENTS;
 
@@ -805,7 +804,7 @@ impl<'a> Xhci<'a> {
             ent.segments[idx].addr = pa;
         }
 
-        self.hal.flush_cache(self.event_ring_table.as_deref().unwrap() as *const EventRingSegmentTable as u64, core::mem::size_of::<EventRingSegmentTable>() as u64, FlushType::Clean);
+        H::flush_cache(self.event_ring_table.as_deref().unwrap() as *const EventRingSegmentTable as u64, core::mem::size_of::<EventRingSegmentTable>() as u64, FlushType::Clean);
 
         // Update Interrupter 0 Dequeu Pointer
         let dequeue_ptr_pa = self.get_ptr::<TRB>(&self.event_ring.as_ref().unwrap().segments[0].trbs[0]);
@@ -829,7 +828,7 @@ impl<'a> Xhci<'a> {
         num_sp |= (tmp & CAP_HCSPARAMS2_MAX_SCRATCH_L_MSAK) >> CAP_HCSPARAMS2_MAX_SCRATCH_L_SHIFT;
         if num_sp > 0 {
             self.scratchpads = Some(Box::new(
-                ScratchPadBufferArray::new_with_capacity(self.hal, num_sp as usize, self.info.page_size as usize)
+                ScratchPadBufferArray::new_with_capacity::<H>(num_sp as usize, self.info.page_size as usize)
             ));
             let scratch_pa = self.get_ptr::<ScratchPadBufferArray>(self.scratchpads.as_ref().unwrap().as_ref());
             self.device_context_baa.as_mut().unwrap().entries[0] = scratch_pa;
@@ -860,7 +859,7 @@ impl<'a> Xhci<'a> {
     }
 
     fn poll_event_ring_trb(&mut self) -> Option<TRBType> {
-        let timeout = Duration::from_millis(1000) + self.hal.current_time();
+        let timeout = Duration::from_millis(1000) + H::current_time();
         loop {
             let pop = self.event_ring.as_mut().expect("").pop(false);
             match pop {
@@ -873,16 +872,16 @@ impl<'a> Xhci<'a> {
                 }
                 None => {}
             }
-            if self.hal.current_time() > timeout {
+            if H::current_time() > timeout {
                 return None;
             }
-            self.hal.sleep(Duration::from_millis(1));
+            H::sleep(Duration::from_millis(1));
         }
     }
 
     #[track_caller]
     fn wait_command_complete(&mut self, ptr: u64) -> Option<CommandCompletionTRB> {
-        self.hal.memory_barrier();
+        H::memory_barrier();
         // TODO update this code to use interrupt notification system
         self.get_doorbell_register(0).reg.write(0);
         loop {
@@ -927,7 +926,7 @@ impl<'a> Xhci<'a> {
             let tmp = (port_status & !OP_PORT_STATUS_PED_MASK) | OP_PORT_STATUS_POWER_MASK;
             port_op.portsc.write(tmp);
             while port_op.portsc.read() & OP_PORT_STATUS_POWER_MASK == 0 {}
-            self.hal.sleep(Duration::from_millis(20));
+            H::sleep(Duration::from_millis(20));
             port_status = port_op.portsc.read();
             debug!("[XHCI] port {} powerup complete: status={:#x}", port_id, port_status);
         }
@@ -1146,7 +1145,7 @@ fn speed_to_xhci(speed: USBSpeed) -> u8 {
     }
 }
 
-pub struct XhciWrapper(pub Mutex<Xhci<'static>>);
+pub struct XhciWrapper<H: XhciHAL>(pub Mutex<Xhci<H>>);
 
 struct USBDeviceMeta {
     pub is_root_hub: bool,
@@ -1160,7 +1159,7 @@ struct USBDeviceMeta {
 
 impl USBMeta for USBDeviceMeta {}
 
-impl USBHostController for XhciWrapper {
+impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
     fn register_root_hub(&self, device: &Arc<RwLock<USBDevice>>) {
         let mut device = device.write();
         device.prv = Some(Box::new(USBDeviceMeta {
@@ -1279,8 +1278,8 @@ impl USBHostController for XhciWrapper {
                 let slot = dev_lock.addr as u8;
 
                 let endpoint_type = endpoint_desc.transfer_type();
-                let endpoint_index = Xhci::get_epctx_index(endpoint_desc.bEndpointAddress);
-                let endpoint_is_input = Xhci::is_ep_input(endpoint_desc.bEndpointAddress);
+                let endpoint_index = Xhci::<H>::get_epctx_index(endpoint_desc.bEndpointAddress);
+                let endpoint_is_input = Xhci::<H>::is_ep_input(endpoint_desc.bEndpointAddress);
 
                 let endpoint_type_value = match (&endpoint_type, endpoint_is_input) {
                     (EndpointType::Control, _) => EP_TYPE_CONTROL_BIDIR,
@@ -1297,7 +1296,7 @@ impl USBHostController for XhciWrapper {
                     this.configure_endpoint(slot, input_ctx,
                                             endpoint_desc.bEndpointAddress,
                                             endpoint_type_value, endpoint_desc.wMaxPacketSize,
-                                            endpoint_desc.bInterval, Xhci::get_max_esti_payload(endpoint_desc));
+                                            endpoint_desc.bInterval, Xhci::<H>::get_max_esti_payload(endpoint_desc));
 
                     // input_ctx.set_configure_ep_meta(configuration.config.config_val,
                     //                                 interface.interface.interface_number, interface.interface.alt_set);
@@ -1350,7 +1349,7 @@ impl USBHostController for XhciWrapper {
         let mut input_ctx = Box::new(if x.info.big_context { InputContext::new_big() } else { InputContext::new_normal() });
 
         let ctx = x.device_contexts[(slot - 1) as usize].as_ref().expect("No context for slot");
-        x.hal.flush_cache(ctx.get_ptr_va(), ctx.get_size() as u64, FlushType::Invalidate);
+        H::flush_cache(ctx.get_ptr_va(), ctx.get_size() as u64, FlushType::Invalidate);
 
         *input_ctx.get_slot_mut() = ctx.get_slot().clone();
         let slot_ctx = input_ctx.get_slot_mut();
@@ -1361,8 +1360,8 @@ impl USBHostController for XhciWrapper {
         // update slot context
         input_ctx.get_input_mut()[1] = 0b1;
 
-        x.hal.flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
-        let input_ctx_ptr = x.hal.translate_addr(input_ctx.get_ptr_va());
+        H::flush_cache(input_ctx.get_ptr_va(), input_ctx.get_size() as u64, FlushType::Clean);
+        let input_ctx_ptr = H::translate_addr(input_ctx.get_ptr_va());
 
         let ptr = x.command_ring.as_mut().expect("").push(
             TRB { command: CommandTRB::configure_endpoint(slot, input_ctx_ptr) }
@@ -1515,13 +1514,4 @@ pub fn init_dwc3(base_address: u64) {
 
     debug!("did dwc3_init()");
 }
-
-
-pub fn do_stuff(base_address: u64, hal: &dyn HAL) {
-    match Xhci::new(base_address, hal).do_stuff() {
-        Ok(()) => info!("did stuff successfully"),
-        Err(e) => error!("Error failed to do stuff: {:?}", e),
-    }
-}
-
 
