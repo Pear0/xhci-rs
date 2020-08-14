@@ -613,11 +613,10 @@ impl<H: XhciHAL> Xhci<H> {
         }
     }
 
-    fn transfer_single_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> USBResult<(usize, bool)> {
+    fn transfer_single_bulk_ring(&mut self, ring: (u8, u8), max_packet_size: usize, mut transfer: TransferBuffer) -> USBResult<(usize, bool)> {
         debug!("transfer_single_bulk_ring(ring:{:?}, transfer:{:?})", ring, transfer);
         let mut my_read_buffer = Box::new([0u8; 512]);
 
-        let max_packet_size = 64;
         let packet_size = core::cmp::min(max_packet_size, transfer.len());
         let my_buffer = &mut my_read_buffer[..packet_size];
 
@@ -661,14 +660,14 @@ impl<H: XhciHAL> Xhci<H> {
         Ok((amount_transferred, can_request_more))
     }
 
-    fn transfer_bulk_ring(&mut self, ring: (u8, u8), mut transfer: TransferBuffer) -> USBResult<usize> {
+    fn transfer_bulk_ring(&mut self, ring: (u8, u8), max_packet_size: usize, mut transfer: TransferBuffer) -> USBResult<usize> {
         let original_length = transfer.len();
         loop {
             if transfer.len() == 0 {
                 return Ok(original_length);
             }
 
-            let (amount, has_more) = self.transfer_single_bulk_ring(ring, transfer.clone_mut())?;
+            let (amount, has_more) = self.transfer_single_bulk_ring(ring, max_packet_size, transfer.clone_mut())?;
             if amount == 0 || !has_more {
                 return Ok((original_length - transfer.len()) + amount);
             }
@@ -1162,7 +1161,7 @@ impl USBMeta for USBDeviceMeta {}
 impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
     fn register_root_hub(&self, device: &Arc<RwLock<USBDevice>>) {
         let mut device = device.write();
-        device.prv = Some(Box::new(USBDeviceMeta {
+        device.protocol_meta = Some(Box::new(USBDeviceMeta {
             is_root_hub: true,
             slot: 0,
             root_port: 0,
@@ -1175,10 +1174,10 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
     fn pipe_open(&self, device: &Arc<RwLock<USBDevice>>, endpoint: Option<&USBEndpointDescriptor>) -> USBResult<Arc<RwLock<USBPipe>>> {
         if endpoint.is_none() {
             let mut dev_lock = device.write();
-            if dev_lock.prv.is_none() {
+            if dev_lock.protocol_meta.is_none() {
                 let slot = dev_lock.addr as u8;
                 assert_ne!(slot, 0);
-                dev_lock.prv.replace(Box::new(USBDeviceMeta {
+                dev_lock.protocol_meta.replace(Box::new(USBDeviceMeta {
                     is_root_hub: false,
                     slot,
                     root_port: 0,
@@ -1192,14 +1191,14 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
         let cloned_device = device.clone();
         let mut dev_lock = device.upgradeable_read();
 
-        assert!(dev_lock.prv.is_some());
+        assert!(dev_lock.protocol_meta.is_some());
 
         let cloned_controller = {
             let bus_lock = dev_lock.bus.read();
             bus_lock.controller.clone()
         };
 
-        let f = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+        let f = dev_lock.protocol_meta.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
             assert!(matches!(endpoint, None));
             return Ok(Arc::new(RwLock::new(USBPipe {
@@ -1207,6 +1206,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
                 controller: cloned_controller,
                 index: 0,
                 endpoint_type: EndpointType::Control,
+                max_packet_size: dev_lock.ddesc.get_max_packet_size() as usize,
                 is_input: true,
             })));
         }
@@ -1231,7 +1231,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
                 {
                     let parent = dev_lock.parent.as_ref().expect("non-root hub has no parent");
                     let par_lock = parent.read();
-                    let f = par_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+                    let f = par_lock.protocol_meta.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
 
                     if f.is_root_hub {
                         parent_slot = 0;
@@ -1247,7 +1247,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
                 }
 
                 let mut dev_lock = dev_lock.upgrade();
-                let mut f = dev_lock.prv.as_mut().unwrap().downcast_mut::<USBDeviceMeta>().unwrap();
+                let mut f = dev_lock.protocol_meta.as_mut().unwrap().downcast_mut::<USBDeviceMeta>().unwrap();
 
                 f.parent_slot = parent_slot;
                 f.route_string = route_string;
@@ -1271,6 +1271,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
                     controller: cloned_controller,
                     index: 0,
                     endpoint_type: EndpointType::Control,
+                    max_packet_size: dev_lock.ddesc.get_max_packet_size() as usize,
                     is_input: true,
                 })));
             }
@@ -1309,6 +1310,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
                     controller: cloned_controller,
                     index: endpoint_index,
                     endpoint_type,
+                    max_packet_size: endpoint_desc.wMaxPacketSize as usize,
                     is_input: endpoint_is_input,
                 })));
             }
@@ -1317,7 +1319,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
 
     fn set_address(&self, device: &Arc<RwLock<USBDevice>>, addr: u32) -> USBResult<()> {
         let dev_lock = device.read();
-        let f = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+        let f = dev_lock.protocol_meta.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
             return Ok(());
         }
@@ -1386,7 +1388,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
         assert_eq!(endpoint.index, 0);
         let dev_lock = endpoint.device.read();
 
-        let meta = dev_lock.prv.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
+        let meta = dev_lock.protocol_meta.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if meta.is_root_hub {
             let mut x = self.0.lock();
             return x.handle_root_hub_command(command);
@@ -1408,7 +1410,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
         let ring = (dev_lock.addr as u8, endpoint.index);
 
         let mut x = self.0.lock();
-        x.transfer_bulk_ring(ring, buffer)
+        x.transfer_bulk_ring(ring, endpoint.max_packet_size, buffer)
     }
 
     fn allocate_slot(&self) -> USBResult<u8> {
