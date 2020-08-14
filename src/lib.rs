@@ -37,14 +37,14 @@ use usb_host::descriptor::*;
 use usb_host::items::{ControlCommand, EndpointType, PortStatus, TransferBuffer, TypeTriple};
 use usb_host::items::TransferDirection::HostToDevice;
 use usb_host::structs::{USBDevice, USBPipe};
-use usb_host::traits::{USBHostController, USBMeta};
+use usb_host::traits::{USBHostController, USBMeta, USBAsyncReadFn};
 
 use crate::consts::*;
 use crate::extended_capability::{ExtendedCapabilityTag, ExtendedCapabilityTags};
 use crate::quirks::XHCIQuirks;
 use crate::registers::{DoorBellRegister, InterrupterRegisters};
 use crate::structs::{DeviceContextArray, DeviceContextBaseAddressArray, EventRingSegmentTable, InputContext, ScratchPadBufferArray, SlotContext, XHCIRing, XHCIRingSegment};
-use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TransferEventTRB, TRB, TRBType};
+use crate::trb::{CommandCompletionTRB, CommandTRB, DataStageTRB, EventDataTRB, NormalTRB, SetupStageTRB, StatusStageTRB, TransferEventTRB, TRB, TRBType, TransferEventTRBStatusWord};
 use crate::trb::TRBType::TransferEvent;
 
 pub mod quirks;
@@ -170,6 +170,14 @@ struct PortContext {
     max_packet_size: u16,
 }
 
+struct IntTransferContext {
+    slot: u8,
+    buf: Vec<u8>,
+    callback: USBAsyncReadFn,
+    packet_size: usize,
+    response: Option<TransferEventTRBStatusWord>,
+}
+
 pub struct Xhci<H: XhciHAL> {
     mmio_virt_base: u64,
     cap: &'static mut XHCICapabilityRegisters,
@@ -180,6 +188,7 @@ pub struct Xhci<H: XhciHAL> {
 
     // (slot, endpoint)
     transfer_rings: HashMap<(u8, u8), Arc<Mutex<XHCIRing<H>>>>,
+    pending_interrupt_transfers: HashMap<u64, IntTransferContext>,
 
     command_ring: Option<XHCIRing<H>>,
     event_ring: Option<XHCIRing<H>>,
@@ -223,6 +232,7 @@ impl<H: XhciHAL> Xhci<H> {
             device_context_baa: None,
             device_contexts: [None; 255],
             transfer_rings: HashMap::new(),
+            pending_interrupt_transfers: HashMap::new(),
             command_ring: None,
             event_ring: None,
             event_ring_table: None,
@@ -599,6 +609,9 @@ impl<H: XhciHAL> Xhci<H> {
             let trb = self.poll_event_ring_trb()?;
             match trb {
                 TRBType::TransferEvent(c) => {
+                    if let Some(ctx) = self.pending_interrupt_transfers.get_mut(&c.trb_pointer) {
+                        ctx.response = Some(c.status);
+                    }
                     if c.trb_pointer == ptr {
                         debug!("Got transfer event: {:?} -> bytes remain: {}", c, c.status.get_bytes_remain());
                         return Some(c);
@@ -857,19 +870,25 @@ impl<H: XhciHAL> Xhci<H> {
         Ok(())
     }
 
+    fn poll_once_event_ring_trb(&mut self) -> Option<TRBType> {
+        let pop = self.event_ring.as_mut().expect("").pop(false);
+        match pop {
+            Some(trb) => {
+                let tmp = self.event_ring.as_ref().expect("").dequeue_pointer() |
+                    INT_ERDP_BUSY_MASK | (INT_ERDP_DESI_MASK & self.event_ring.as_ref().expect("").dequeue.0 as u64);
+                self.get_runtime_interrupt_register(0).event_ring_deque_ptr.write(tmp);
+                let lol = TRBType::from(trb);
+                Some(lol)
+            }
+            None => None
+        }
+    }
+
     fn poll_event_ring_trb(&mut self) -> Option<TRBType> {
         let timeout = Duration::from_millis(1000) + H::current_time();
         loop {
-            let pop = self.event_ring.as_mut().expect("").pop(false);
-            match pop {
-                Some(trb) => {
-                    let tmp = self.event_ring.as_ref().expect("").dequeue_pointer() |
-                        INT_ERDP_BUSY_MASK | (INT_ERDP_DESI_MASK & self.event_ring.as_ref().expect("").dequeue.0 as u64);
-                    self.get_runtime_interrupt_register(0).event_ring_deque_ptr.write(tmp);
-                    let lol = TRBType::from(trb);
-                    return Some(lol);
-                }
-                None => {}
+            if let Some(trb) = self.poll_once_event_ring_trb() {
+                return Some(trb);
             }
             if H::current_time() > timeout {
                 return None;
@@ -886,6 +905,11 @@ impl<H: XhciHAL> Xhci<H> {
         loop {
             let trb = self.poll_event_ring_trb()?;
             match trb {
+                TRBType::TransferEvent(c) => {
+                    if let Some(ctx) = self.pending_interrupt_transfers.get_mut(&c.trb_pointer) {
+                        ctx.response = Some(c.status);
+                    }
+                }
                 TRBType::CommandCompletion(c) => {
                     if c.trb_pointer == ptr {
                         debug!("Got command completion: {:?}", c);
@@ -1403,7 +1427,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
     }
 
     fn bulk_transfer(&self, endpoint: &USBPipe, buffer: TransferBuffer) -> USBResult<usize> {
-        assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk | EndpointType::Interrupt));
+        assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk));
 
         let dev_lock = endpoint.device.read();
 
@@ -1413,6 +1437,42 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
         x.transfer_bulk_ring(ring, endpoint.max_packet_size, buffer)
     }
 
+    fn async_read(&self, endpoint: &USBPipe, buf: Vec<u8>, int_callback: USBAsyncReadFn) -> USBResult<()> {
+
+        // TODO this code does not ensure that buffers are cache aligned. may have problems on ARM
+        H::flush_cache(buf.as_ptr() as u64, buf.len() as u64, FlushType::CleanAndInvalidate);
+
+        assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk | EndpointType::Interrupt));
+        assert!(endpoint.is_input);
+
+        let dev_lock = endpoint.device.read();
+        let ring_addr = (dev_lock.addr as u8, endpoint.index);
+
+        let packet_size = core::cmp::min(endpoint.max_packet_size, buf.len());
+
+        let mut x = self.0.lock();
+
+        let ring = x.transfer_rings.get(&ring_addr).ok_or(USBErrorKind::InvalidArgument.msg("invalid pipe has no ring"))?;
+        let mut ring_lock = ring.lock();
+
+        let normal = NormalTRB::new::<H>(buf.as_slice(), packet_size);
+        let ptr = ring_lock.push(TRB { normal });
+
+        core::mem::drop(ring_lock);
+
+        x.pending_interrupt_transfers.insert(ptr, IntTransferContext {
+            slot: ring_addr.0,
+            buf,
+            callback: int_callback,
+            packet_size,
+            response: None,
+        });
+
+        x.trigger_ring_doorbell(ring_addr);
+
+        Ok(())
+    }
+
     fn allocate_slot(&self) -> USBResult<u8> {
         let mut x = self.0.lock();
         x.send_slot_enable()
@@ -1420,6 +1480,61 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
 
     fn free_slot(&self, slot: u8) {
         debug!("free_slot(): leaking slot={}", slot);
+    }
+
+    fn process_interrupts(&self) {
+
+        let mut x = self.0.lock();
+
+        // process the full event ring...
+        while let Some(trb) = x.poll_once_event_ring_trb() {
+            match trb {
+                TRBType::TransferEvent(c) => {
+                    if let Some(ctx) = x.pending_interrupt_transfers.get_mut(&c.trb_pointer) {
+                        ctx.response = Some(c.status);
+                    }
+                }
+                e => {
+                    warn!("interrupt ate trb: {:?}", e);
+                }
+            }
+        }
+
+        let mut done_trbs: Vec<u64> = Vec::new();
+        for (ptr, ctx) in x.pending_interrupt_transfers.iter() {
+            if ctx.response.is_some() {
+                done_trbs.push(*ptr);
+            }
+        }
+
+        let mut done_contexts: Vec<IntTransferContext> = Vec::new();
+        for ptr in done_trbs.iter() {
+            if let Some(ctx) = x.pending_interrupt_transfers.remove(ptr) {
+                done_contexts.push(ctx);
+            }
+        }
+
+        // don't hold the XHCI lock so that the callbacks can queue more interrupts.
+        core::mem::drop(x);
+
+        for mut ctx in done_contexts.drain(..) {
+            let status = ctx.response.unwrap();
+
+            let code = TRBCompletionCode::from(status.get_code());
+            let result = if !matches!(code, TRBCompletionCode::Success | TRBCompletionCode::ShortPacket) {
+                Err(code.into())
+            } else {
+                Ok(ctx.packet_size - status.get_bytes_remain() as usize)
+            };
+
+            // we need to take ownership of the buffer because calling callback will consume...
+            let buf = core::mem::replace(&mut ctx.buf, Vec::new());
+
+            H::flush_cache(buf.as_ptr() as u64, buf.len() as u64, FlushType::Invalidate);
+
+            (ctx.callback)(buf, result);
+        }
+
     }
 }
 
