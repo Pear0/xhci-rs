@@ -1217,10 +1217,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
 
         assert!(dev_lock.protocol_meta.is_some());
 
-        let cloned_controller = {
-            let bus_lock = dev_lock.bus.read();
-            bus_lock.controller.clone()
-        };
+        let cloned_controller = dev_lock.bus.controller.clone();
 
         let f = dev_lock.protocol_meta.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
