@@ -1212,12 +1212,12 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
             }
         }
 
-        let cloned_device = device.clone();
+        let cloned_device = Arc::downgrade(&device);
         let mut dev_lock = device.upgradeable_read();
 
         assert!(dev_lock.protocol_meta.is_some());
 
-        let cloned_controller = dev_lock.bus.controller.clone();
+        let cloned_controller = Arc::downgrade(&dev_lock.bus.controller);
 
         let f = dev_lock.protocol_meta.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if f.is_root_hub {
@@ -1407,7 +1407,8 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
 
     fn control_transfer(&self, endpoint: &USBPipe, command: ControlCommand) -> USBResult<()> {
         assert_eq!(endpoint.index, 0);
-        let dev_lock = endpoint.device.read();
+        let device = endpoint.get_device()?;
+        let dev_lock = device.read();
 
         let meta = dev_lock.protocol_meta.as_ref().unwrap().downcast_ref::<USBDeviceMeta>().unwrap();
         if meta.is_root_hub {
@@ -1426,7 +1427,8 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
     fn bulk_transfer(&self, endpoint: &USBPipe, buffer: TransferBuffer) -> USBResult<usize> {
         assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk));
 
-        let dev_lock = endpoint.device.read();
+        let device = endpoint.get_device()?;
+        let dev_lock = device.read();
 
         let ring = (dev_lock.addr as u8, endpoint.index);
 
@@ -1442,7 +1444,8 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
         assert!(matches!(endpoint.endpoint_type, EndpointType::Bulk | EndpointType::Interrupt));
         assert!(endpoint.is_input);
 
-        let dev_lock = endpoint.device.read();
+        let device = endpoint.get_device()?;
+        let dev_lock = device.read();
         let ring_addr = (dev_lock.addr as u8, endpoint.index);
 
         let packet_size = core::cmp::min(endpoint.max_packet_size, buf.len());
