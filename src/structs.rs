@@ -1,4 +1,4 @@
-use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
+use alloc::alloc::{AllocRef, Global, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter};
@@ -449,8 +449,9 @@ impl ScratchPadBufferArray {
             page_size,
         };
         for i in 0..num {
-            let ptr = Global.alloc(Layout::from_size_align(page_size, page_size).expect("alignment"),
-                                   AllocInit::Zeroed).expect("alloc failed").ptr.as_ptr() as u64;
+            let ptr = Global.alloc_zeroed(
+                Layout::from_size_align(page_size, page_size).expect("alignment"))
+                .expect("alloc failed").as_ptr() as *const u8 as u64;
             thing.scratchpad_vas[i] = ptr;
             thing.scratchpads[i] = H::translate_addr(ptr);
         }

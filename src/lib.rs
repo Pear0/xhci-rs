@@ -16,7 +16,7 @@ extern crate log;
 #[macro_use]
 extern crate usb_host;
 
-use alloc::alloc::{AllocInit, AllocRef, Global, Layout};
+use alloc::alloc::{AllocRef, Global, Layout};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -149,7 +149,7 @@ pub trait XhciHAL: usb_host::UsbHAL + Send + Sync {
     fn flush_cache(addr: u64, len: u64, flush: FlushType);
 
     fn alloc_noncached(layout: Layout) -> Option<u64> {
-        Global.alloc(layout, AllocInit::Zeroed).ok().map(|x| x.ptr.as_ptr() as u64)
+        Global.alloc_zeroed(layout).ok().map(|x| x.as_ptr() as *const u8 as u64)
     }
 
     fn free_noncached(ptr: u64, layout: Layout) {
