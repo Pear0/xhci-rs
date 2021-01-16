@@ -2,7 +2,6 @@
 #![feature(const_in_array_repeat_expressions)]
 #![feature(global_asm)]
 #![feature(llvm_asm)]
-#![feature(track_caller)]
 
 #![allow(dead_code, unused_imports, unused_parens, unused_variables)]
 
@@ -241,7 +240,9 @@ impl<H: XhciHAL> Xhci<H> {
             __phantom: PhantomData::default(),
         };
 
-        this.do_stuff();
+        if let Err(e) = this.do_stuff() {
+            error!("failed to init usb: {:?}", e);
+        }
         this
     }
 
@@ -1213,7 +1214,7 @@ impl<H: XhciHAL> USBHostController for XhciWrapper<H> {
         }
 
         let cloned_device = Arc::downgrade(&device);
-        let mut dev_lock = device.upgradeable_read();
+        let dev_lock = device.upgradeable_read();
 
         assert!(dev_lock.protocol_meta.is_some());
 
