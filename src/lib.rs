@@ -1,5 +1,4 @@
 #![feature(allocator_api)]
-#![feature(const_in_array_repeat_expressions)]
 #![feature(global_asm)]
 #![feature(llvm_asm)]
 
@@ -15,7 +14,7 @@ extern crate log;
 #[macro_use]
 extern crate usb_host;
 
-use alloc::alloc::{AllocRef, Global, Layout};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -148,12 +147,17 @@ pub trait XhciHAL: usb_host::UsbHAL + Send + Sync {
     fn flush_cache(addr: u64, len: u64, flush: FlushType);
 
     fn alloc_noncached(layout: Layout) -> Option<u64> {
-        Global.alloc_zeroed(layout).ok().map(|x| x.as_ptr() as *const u8 as u64)
+        let v = unsafe { alloc_zeroed(layout) as *const u8 as u64 };
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     fn free_noncached(ptr: u64, layout: Layout) {
         unsafe {
-            Global.dealloc(NonNull::new_unchecked(ptr as *mut u8), layout);
+            dealloc(ptr as *mut u8, layout);
         }
     }
 }
@@ -183,7 +187,7 @@ pub struct Xhci<H: XhciHAL> {
     op: &'static mut XHCIOperationalRegisters,
     info: XHCIInfo,
     device_context_baa: Option<Box<DeviceContextBaseAddressArray>>,
-    device_contexts: [Option<Box<DeviceContextArray>>; 255],
+    device_contexts: Vec<Option<Box<DeviceContextArray>>>,
 
     // (slot, endpoint)
     transfer_rings: HashMap<(u8, u8), Arc<Mutex<XHCIRing<H>>>>,
@@ -223,13 +227,18 @@ impl<H: XhciHAL> Xhci<H> {
         info.doorbell_offset = cap.doorbell_offset.read() & CAP_DBOFFSET_MASK;
         info.runtime_offset = cap.rts_offset.read() & CAP_RTSOFFSET_MASK;
 
+        let mut device_contexts = Vec::with_capacity(255);
+        for _ in 0..255 {
+            device_contexts.push(None);
+        }
+
         let mut this = Self {
             mmio_virt_base: base_address,
             cap,
             op: op_regs,
             info,
             device_context_baa: None,
-            device_contexts: [None; 255],
+            device_contexts,
             transfer_rings: HashMap::new(),
             pending_interrupt_transfers: HashMap::new(),
             command_ring: None,

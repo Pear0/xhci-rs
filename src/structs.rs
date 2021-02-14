@@ -1,4 +1,4 @@
-use alloc::alloc::{AllocRef, Global, Layout};
+use alloc::alloc::{Layout, dealloc, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter};
@@ -449,9 +449,8 @@ impl ScratchPadBufferArray {
             page_size,
         };
         for i in 0..num {
-            let ptr = Global.alloc_zeroed(
-                Layout::from_size_align(page_size, page_size).expect("alignment"))
-                .expect("alloc failed").as_ptr() as *const u8 as u64;
+            let ptr = unsafe { alloc_zeroed(
+                Layout::from_size_align(page_size, page_size).expect("valid layout")) as *const u8 as u64 };
             thing.scratchpad_vas[i] = ptr;
             thing.scratchpads[i] = H::translate_addr(ptr);
         }
@@ -465,7 +464,7 @@ impl Drop for ScratchPadBufferArray {
         for pad in self.scratchpad_vas.iter() {
             if *pad != 0 {
                 unsafe {
-                    Global.dealloc(NonNull::<u8>::new_unchecked((*pad) as *mut u8),
+                    dealloc((*pad) as *mut u8,
                                    Layout::from_size_align(self.page_size, self.page_size)
                                        .expect("align"))
                 };
